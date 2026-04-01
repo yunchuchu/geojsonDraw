@@ -15,15 +15,18 @@ import {
   closeRing,
   expandBounds,
   geometryToAmapPath,
+  getMinimumAreaBoundingRectangle,
   geometryToSinglePolygonRings,
   getBoundsFromGeometry,
+  translatePolygonRings,
   transformFeatureCoordinates,
   type BBox,
   type CoordinateSystem,
+  type PolygonRing,
   type PolygonRings,
 } from './utils/geometry'
 
-type DrawMode = 'none' | 'point' | 'polygon' | 'building-rectangle'
+type DrawMode = 'none' | 'polygon' | 'building-rectangle'
 type ExportCoordinateSystem = CoordinateSystem
 type SurfaceGeometry = Polygon | MultiPolygon
 type ExportGeometry = Point | SurfaceGeometry
@@ -100,6 +103,7 @@ const CANDIDATE_SELECTED_STYLE = {
 const BUILDING_LAYER_MIN_ZOOM = 15
 const BUILDING_LAYER_RENDER_LIMIT = 1800
 const BUILDING_LAYER_BOUNDS_PADDING = 0.01
+const SURFACE_DRAG_HANDLE_OFFSET_PX = 44
 
 const amapKey = import.meta.env.VITE_AMAP_KEY as string | undefined
 const amapSearchKey =
@@ -144,6 +148,10 @@ let polygonEditor: any | null = null
 let suggestionTimer: number | null = null
 let suggestionRequestSeq = 0
 let mapApi: any | null = null
+let surfaceDragHandleMarker: any | null = null
+let surfaceDragStartPosition: [number, number] | null = null
+let surfaceDragStartRings: PolygonRings | null = null
+let surfaceDragPointerCleanup: (() => void) | null = null
 
 const overlays = new Map<string, StoredOverlay>()
 const buildingCandidatesById = new Map<string, CandidateBuilding>()
@@ -162,12 +170,6 @@ const parsedFeatureCollection = computed(() => {
 })
 
 const featureCount = computed(() => parsedFeatureCollection.value.features.length)
-const pointCount = computed(
-  () =>
-    parsedFeatureCollection.value.features.filter(
-      (feature) => feature.geometry?.type === 'Point',
-    ).length,
-)
 const polygonCount = computed(
   () =>
     parsedFeatureCollection.value.features.filter((feature) => {
@@ -274,6 +276,234 @@ const getNormalizedSurfaceGeometry = (
   return getSurfaceGeometryFromRings(geometry.type, rings)
 }
 
+const getSurfaceFeatureById = (id: string): Feature<SurfaceGeometry, GeoJsonProperties> | null => {
+  const feature = features.find((item) => String(item.id) === id)
+  if (!feature || feature.geometry.type === 'Point') {
+    return null
+  }
+  return feature as Feature<SurfaceGeometry, GeoJsonProperties>
+}
+
+const getDragHandlePosition = (geometry: SurfaceGeometry): [number, number] | null => {
+  const bounds = getBoundsFromGeometry(geometry)
+  if (!bounds) return null
+
+  const centerLng = (bounds[0] + bounds[2]) / 2
+  const topLat = bounds[3]
+
+  if (!map || !mapApi?.Pixel || !map.lngLatToContainer || !map.containerToLngLat) {
+    return [centerLng, topLat]
+  }
+
+  const pixel = map.lngLatToContainer([centerLng, topLat])
+  if (!pixel) {
+    return [centerLng, topLat]
+  }
+
+  const x = typeof pixel.getX === 'function' ? pixel.getX() : pixel.x
+  const y = (typeof pixel.getY === 'function' ? pixel.getY() : pixel.y) - SURFACE_DRAG_HANDLE_OFFSET_PX
+  const lngLat = map.containerToLngLat(new mapApi.Pixel(x, y))
+
+  return lngLat ? toLngLatPair(lngLat) : [centerLng, topLat]
+}
+
+const getLngLatFromClientPoint = (clientX: number, clientY: number): [number, number] | null => {
+  if (!mapContainer.value || !mapApi?.Pixel || !map?.containerToLngLat) {
+    return null
+  }
+
+  const rect = mapContainer.value.getBoundingClientRect()
+  const pixel = new mapApi.Pixel(clientX - rect.left, clientY - rect.top)
+  const lngLat = map.containerToLngLat(pixel)
+  return lngLat ? toLngLatPair(lngLat) : null
+}
+
+const teardownSurfaceDragHandle = (): void => {
+  surfaceDragPointerCleanup?.()
+  surfaceDragPointerCleanup = null
+  if (surfaceDragHandleMarker && map) {
+    map.remove(surfaceDragHandleMarker)
+  }
+  surfaceDragHandleMarker = null
+  surfaceDragStartPosition = null
+  surfaceDragStartRings = null
+}
+
+const syncSurfaceDragHandlePosition = (): void => {
+  if (!surfaceDragHandleMarker || !selectedFeatureId.value) return
+
+  const selectedFeature = getSurfaceFeatureById(selectedFeatureId.value)
+  if (!selectedFeature) return
+
+  const position = getDragHandlePosition(selectedFeature.geometry)
+  if (!position) return
+  surfaceDragHandleMarker.setPosition(position)
+}
+
+const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
+  if (!map || !mapApi) return
+
+  const currentFeature = getSurfaceFeatureById(selected.id)
+  if (!currentFeature) return
+
+  const position = getDragHandlePosition(currentFeature.geometry)
+  if (!position) return
+
+  teardownSurfaceDragHandle()
+
+  const workbench = document.createElement('div')
+  workbench.className = 'surface-workbench'
+
+  const dragButton = document.createElement('button')
+  dragButton.type = 'button'
+  dragButton.className = 'surface-workbench__drag'
+  dragButton.setAttribute('aria-label', '拖拽选中面')
+  dragButton.title = '拖拽'
+  dragButton.textContent = '拖拽'
+
+  const flattenButton = document.createElement('button')
+  flattenButton.type = 'button'
+  flattenButton.className = 'surface-workbench__action'
+  flattenButton.title = '规整'
+  flattenButton.textContent = '规整'
+
+  const deleteButton = document.createElement('button')
+  deleteButton.type = 'button'
+  deleteButton.className = 'surface-workbench__action surface-workbench__action--danger'
+  deleteButton.title = '删除'
+  deleteButton.textContent = '删除'
+
+  const finishButton = document.createElement('button')
+  finishButton.type = 'button'
+  finishButton.className = 'surface-workbench__action'
+  finishButton.title = '完成'
+  finishButton.textContent = '完成'
+
+  workbench.append(dragButton, flattenButton, deleteButton, finishButton)
+
+  const handleMarker = new mapApi.Marker({
+    position,
+    draggable: false,
+    bubble: false,
+    zIndex: 430,
+    offset: new mapApi.Pixel(-84, -18),
+    content: workbench,
+  })
+
+  handleMarker.setMap(map)
+
+  const startDrag = (event: MouseEvent): void => {
+    event.preventDefault()
+    event.stopPropagation()
+
+    const feature = getSurfaceFeatureById(selected.id)
+    const rings = feature ? geometryToSinglePolygonRings(feature.geometry) : null
+    if (!rings) return
+
+    surfaceDragStartPosition = toLngLatPair(handleMarker.getPosition())
+    surfaceDragStartRings = rings.map((ring) => ring.map(([lng, lat]) => [lng, lat] as [number, number]))
+    polygonEditor?.close()
+    polygonEditor = null
+    map?.setDefaultCursor('grabbing')
+
+    const handleMove = (moveEvent: MouseEvent): void => {
+      if (!surfaceDragStartPosition || !surfaceDragStartRings) return
+
+      const nextPosition = getLngLatFromClientPoint(moveEvent.clientX, moveEvent.clientY)
+      if (!nextPosition) return
+
+      const deltaLng = nextPosition[0] - surfaceDragStartPosition[0]
+      const deltaLat = nextPosition[1] - surfaceDragStartPosition[1]
+      const nextRings = translatePolygonRings(surfaceDragStartRings, deltaLng, deltaLat)
+      const nextGeometry = getSurfaceGeometryFromRings(
+        selected.geometryType as SurfaceGeometryType,
+        nextRings,
+      )
+      const nextPath = geometryToAmapPath(nextGeometry)
+      if (!nextPath) return
+
+      selected.overlay.setPath(nextPath)
+      handleMarker.setPosition(nextPosition)
+    }
+
+    const handleUp = (upEvent: MouseEvent): void => {
+      const currentFeature = getSurfaceFeatureById(selected.id)
+      const nextPosition = getLngLatFromClientPoint(upEvent.clientX, upEvent.clientY)
+      const safePosition = nextPosition ?? toLngLatPair(handleMarker.getPosition())
+
+      if (!surfaceDragStartPosition || !surfaceDragStartRings) {
+        surfaceDragPointerCleanup?.()
+        surfaceDragPointerCleanup = null
+        map?.setDefaultCursor('default')
+        syncSurfaceDragHandlePosition()
+        return
+      }
+
+      const deltaLng = safePosition[0] - surfaceDragStartPosition[0]
+      const deltaLat = safePosition[1] - surfaceDragStartPosition[1]
+      const nextRings = translatePolygonRings(surfaceDragStartRings, deltaLng, deltaLat)
+      const nextGeometry = getSurfaceGeometryFromRings(
+        selected.geometryType as SurfaceGeometryType,
+        nextRings,
+      )
+      const nextPath = geometryToAmapPath(nextGeometry)
+
+      surfaceDragStartPosition = null
+      surfaceDragStartRings = null
+      surfaceDragPointerCleanup?.()
+      surfaceDragPointerCleanup = null
+      map?.setDefaultCursor('default')
+
+      if (!currentFeature || !nextPath) {
+        syncSurfaceDragHandlePosition()
+        return
+      }
+
+      selected.overlay.setPath(nextPath)
+      updateFeature(selected.id, {
+        ...currentFeature,
+        geometry: nextGeometry,
+      })
+
+      if (isEditingSelected.value) {
+        startEditSelected()
+        feedback.value = '已通过上方工作区移动选中面。'
+        return
+      }
+
+      syncSurfaceDragHandlePosition()
+      feedback.value = '已通过上方工作区移动选中面。'
+    }
+
+    window.addEventListener('mousemove', handleMove)
+    window.addEventListener('mouseup', handleUp, { once: true })
+    surfaceDragPointerCleanup = () => {
+      window.removeEventListener('mousemove', handleMove)
+      window.removeEventListener('mouseup', handleUp)
+    }
+  }
+
+  dragButton.addEventListener('mousedown', startDrag)
+  flattenButton.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    flattenSelectedSurface()
+  })
+  deleteButton.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    deleteSelected()
+  })
+  finishButton.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    stopPolygonEditing()
+    feedback.value = '已结束当前面的编辑。'
+  })
+
+  surfaceDragHandleMarker = handleMarker
+}
+
 const setSelectedBuildingCandidateIds = (ids: string[]): void => {
   selectedBuildingCandidateIds.value = ids
   for (const candidateId of buildingCandidateOverlays.keys()) {
@@ -305,6 +535,9 @@ const applyBuildingCandidateStyle = (candidateId: string): void => {
 }
 
 const setSelectedFeature = (nextId: string | null): void => {
+  if (selectedFeatureId.value !== nextId && isEditingSelected.value) {
+    stopPolygonEditing()
+  }
   if (selectedFeatureId.value && overlays.has(selectedFeatureId.value)) {
     applySelectionStyle(overlays.get(selectedFeatureId.value) as StoredOverlay, false)
   }
@@ -317,7 +550,15 @@ const setSelectedFeature = (nextId: string | null): void => {
 const bindExportOverlayEvents = (overlayItem: StoredOverlay): void => {
   overlayItem.overlay.on('click', () => {
     setSelectedFeature(overlayItem.id)
-    feedback.value = '已选中导出要素，可点击“编辑选中面”或“删除选中”。'
+    if (overlayItem.kind === 'export-surface') {
+      if (selectedFeatureId.value !== overlayItem.id || !isEditingSelected.value) {
+        startEditSelected()
+      }
+      feedback.value = '已选中面要素，已自动进入编辑模式。'
+      return
+    }
+
+    feedback.value = '已选中导出要素，可继续删除。'
   })
 }
 
@@ -339,6 +580,7 @@ const createExportPointMarker = (feature: Feature<Point>): StoredOverlay => {
   const marker = new mapApi.Marker({
     position: [...feature.geometry.coordinates],
     draggable: true,
+    bubble: false,
   })
   marker.setMap(map)
   marker.on('dragend', () => {
@@ -368,6 +610,7 @@ const createExportSurfaceOverlay = (feature: Feature<SurfaceGeometry>): StoredOv
 
   const polygon = new mapApi.Polygon({
     path,
+    bubble: false,
     ...EXPORT_SURFACE_STYLE,
   })
   polygon.setMap(map)
@@ -400,31 +643,6 @@ const updateFeature = (id: string, nextFeature: ExportFeature): void => {
   syncGeojson()
 }
 
-const addPointFeature = (marker: any): void => {
-  const id = createFeatureId()
-  const [lng, lat] = toLngLatPair(marker.getPosition())
-  const feature: Feature<Point> = {
-    type: 'Feature',
-    id,
-    properties: {
-      sourceType: 'manual',
-    },
-    geometry: {
-      type: 'Point',
-      coordinates: [lng, lat],
-    },
-  }
-
-  if (map) {
-    map.remove(marker)
-  }
-
-  registerExportFeature(feature)
-  features = [...features, feature]
-  syncGeojson()
-  setSelectedFeature(id)
-}
-
 const normalizePolygonPathInput = (path: any): any[][] => {
   if (!Array.isArray(path) || path.length === 0) {
     return []
@@ -445,10 +663,10 @@ const getPolygonRingsFromOverlay = (polygon: any): PolygonRings => {
     .filter((ring) => ring.length >= 4)
 }
 
-const addPolygonFeature = (polygon: any): void => {
+const addPolygonFeatureFromRing = (ring: PolygonRing): void => {
   const id = createFeatureId()
-  const rings = getPolygonRingsFromOverlay(polygon)
-  if (!rings.length) {
+  const closedRing = closeRing(ring)
+  if (closedRing.length < 4) {
     feedback.value = '当前面要素无有效坐标，未能写入导出集合。'
     return
   }
@@ -461,12 +679,8 @@ const addPolygonFeature = (polygon: any): void => {
     },
     geometry: {
       type: 'Polygon',
-      coordinates: rings,
+      coordinates: [closedRing],
     },
-  }
-
-  if (map) {
-    map.remove(polygon)
   }
 
   registerExportFeature(feature)
@@ -480,9 +694,7 @@ const removeFeatureById = (id: string): void => {
   if (!target || !map) return
 
   if (selectedFeatureId.value === id) {
-    polygonEditor?.close()
-    polygonEditor = null
-    isEditingSelected.value = false
+    stopPolygonEditing()
   }
 
   map.remove(target.overlay)
@@ -507,6 +719,7 @@ const stopDrawing = (): void => {
 const stopPolygonEditing = (): void => {
   polygonEditor?.close()
   polygonEditor = null
+  teardownSurfaceDragHandle()
   isEditingSelected.value = false
 }
 
@@ -549,24 +762,92 @@ const startEditSelected = (): void => {
   polygonEditor.on('removenode', syncPolygon)
   polygonEditor.on('end', syncPolygon)
   polygonEditor.open()
+  setupSurfaceDragHandle(selected)
   isEditingSelected.value = true
-  feedback.value = '面编辑模式已开启：拖拽顶点修改形状。'
+  feedback.value = '面编辑模式已开启：可在上方工作区拖拽、规整、删除或完成。'
 }
 
-const startDrawPoint = (): void => {
-  if (!mouseTool) return
-  setSelectedFeature(null)
-  drawMode.value = 'point'
-  mouseTool.close()
-  map?.setDefaultCursor('crosshair')
-  mouseTool.marker({
-    draggable: true,
+const flattenSelectedSurface = (): void => {
+  if (!selectedFeatureId.value) {
+    feedback.value = '请先选中一个面要素。'
+    return
+  }
+
+  const selected = overlays.get(selectedFeatureId.value)
+  if (!selected || selected.kind !== 'export-surface') {
+    feedback.value = '当前选中要素不是面，无法平整。'
+    return
+  }
+
+  const currentFeature = features.find((feature) => String(feature.id) === selected.id)
+  if (!currentFeature || currentFeature.geometry.type === 'Point') {
+    feedback.value = '当前选中要素不是面，无法平整。'
+    return
+  }
+
+  const rings = geometryToSinglePolygonRings(currentFeature.geometry)
+  if (!rings || rings.length !== 1) {
+    feedback.value = '平整当前仅支持单环面要素。'
+    return
+  }
+
+  const flattenedOuterRing = getMinimumAreaBoundingRectangle(rings[0])
+  if (!flattenedOuterRing) {
+    feedback.value = '当前面形状不足以进行平整。'
+    return
+  }
+
+  const nextGeometry = getSurfaceGeometryFromRings(
+    selected.geometryType as SurfaceGeometryType,
+    [flattenedOuterRing],
+  )
+  const nextPath = geometryToAmapPath(nextGeometry)
+  if (!nextPath) {
+    feedback.value = '平整失败，请重试。'
+    return
+  }
+
+  const shouldResumeEditing = isEditingSelected.value
+  if (shouldResumeEditing) {
+    stopPolygonEditing()
+  }
+
+  selected.overlay.setPath(nextPath)
+  updateFeature(selected.id, {
+    ...currentFeature,
+    geometry: nextGeometry,
   })
-  feedback.value = '点绘制模式已开启：点击地图添加点。'
+
+  if (shouldResumeEditing) {
+    startEditSelected()
+  }
+
+  feedback.value = '已将选中面平整为最小外接矩形。'
+}
+
+const addPolygonFeature = (polygon: any): void => {
+  const rings = getPolygonRingsFromOverlay(polygon)
+  if (!rings.length) {
+    feedback.value = '当前面要素无有效坐标，未能写入导出集合。'
+    return
+  }
+
+  const [outerRing] = rings
+  if (!outerRing) {
+    feedback.value = '当前面要素无有效坐标，未能写入导出集合。'
+    return
+  }
+
+  if (map) {
+    map.remove(polygon)
+  }
+
+  addPolygonFeatureFromRing(outerRing)
 }
 
 const startDrawPolygon = (): void => {
   if (!mouseTool) return
+  stopPolygonEditing()
   setSelectedFeature(null)
   drawMode.value = 'polygon'
   mouseTool.close()
@@ -574,7 +855,35 @@ const startDrawPolygon = (): void => {
   mouseTool.polygon({
     ...EXPORT_SURFACE_STYLE,
   })
-  feedback.value = '面绘制模式已开启：点击地图依次落点，双击结束。'
+  feedback.value = '面绘制模式已开启：点击地图开始绘制，双击结束。'
+}
+
+const toggleDrawPolygon = (): void => {
+  if (drawMode.value === 'polygon') {
+    stopDrawing()
+    feedback.value = '已退出面绘制模式。'
+    return
+  }
+
+  startDrawPolygon()
+}
+
+const handleMapBlankDoubleClick = (): void => {
+  if (drawMode.value !== 'none') return
+  if (isEditingSelected.value) return
+  startDrawPolygon()
+}
+
+const handleWindowKeydown = (event: KeyboardEvent): void => {
+  const target = event.target as HTMLElement | null
+  const tagName = target?.tagName
+  if (tagName === 'INPUT' || tagName === 'TEXTAREA') return
+
+  if (drawMode.value === 'polygon' && event.key === 'Escape') {
+    event.preventDefault()
+    stopDrawing()
+    feedback.value = '已取消当前面的绘制。'
+  }
 }
 
 const getMapBoundsBBox = (): BBox | null => {
@@ -645,6 +954,7 @@ const refreshVisibleBuildingCandidates = (): void => {
 
     const polygon = new mapApi.Polygon({
       path,
+      bubble: false,
       ...CANDIDATE_SURFACE_STYLE,
     })
     polygon.setMap(map)
@@ -1233,26 +1543,28 @@ onMounted(async () => {
     mouseTool.on('draw', (event: { obj?: any }) => {
       if (!event.obj) return
 
-      if (drawMode.value === 'point') {
-        addPointFeature(event.obj)
-        feedback.value = '点位已加入导出集合。'
-      } else if (drawMode.value === 'polygon') {
+      if (drawMode.value === 'polygon') {
         addPolygonFeature(event.obj)
-        feedback.value = '面要素已加入导出集合。'
+        stopDrawing()
+        startEditSelected()
+        feedback.value = '面要素已加入导出集合，并已进入编辑模式。'
       } else if (drawMode.value === 'building-rectangle') {
         handleRectangleSelection(event.obj)
+        stopDrawing()
       }
-
-      stopDrawing()
     })
 
+    map.on('dblclick', handleMapBlankDoubleClick)
     map.on('moveend', () => {
       refreshVisibleBuildingCandidates()
+      syncSurfaceDragHandlePosition()
     })
     map.on('zoomend', () => {
       currentMapZoom.value = map?.getZoom?.() ?? currentMapZoom.value
       refreshVisibleBuildingCandidates()
+      syncSurfaceDragHandlePosition()
     })
+    window.addEventListener('keydown', handleWindowKeydown)
   } catch (error) {
     console.error(error)
     feedback.value = '高德底图初始化失败，请检查 Key、安全密钥和域名白名单。'
@@ -1264,6 +1576,7 @@ onUnmounted(() => {
     window.clearTimeout(suggestionTimer)
     suggestionTimer = null
   }
+  window.removeEventListener('keydown', handleWindowKeydown)
 
   stopDrawing()
   stopPolygonEditing()
@@ -1330,30 +1643,11 @@ onUnmounted(() => {
       <button
         type="button"
         class="btn"
-        :class="drawMode === 'point' ? 'btn-primary' : 'btn-ghost'"
-        @click="startDrawPoint"
-      >
-        绘制点
-      </button>
-      <button
-        type="button"
-        class="btn"
         :class="drawMode === 'polygon' ? 'btn-primary' : 'btn-ghost'"
-        @click="startDrawPolygon"
+        @click="toggleDrawPolygon"
       >
-        绘制面
+        {{ drawMode === 'polygon' ? '完成绘制' : '绘制面' }}
       </button>
-      <button type="button" class="btn btn-ghost" @click="stopDrawing">停止绘制</button>
-      <button type="button" class="btn btn-ghost" @click="startEditSelected">编辑选中面</button>
-      <button
-        type="button"
-        class="btn btn-ghost"
-        :disabled="!isEditingSelected"
-        @click="stopPolygonEditing"
-      >
-        结束编辑
-      </button>
-      <button type="button" class="btn btn-ghost" @click="deleteSelected">删除选中</button>
 
       <button
         type="button"
@@ -1414,7 +1708,6 @@ onUnmounted(() => {
         <div class="modal-body">
           <div class="stats">
             <span>总要素：{{ featureCount }}</span>
-            <span>点：{{ pointCount }}</span>
             <span>面：{{ polygonCount }}</span>
           </div>
 

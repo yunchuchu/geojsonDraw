@@ -14,6 +14,7 @@ export type PolygonRings = PolygonRing[]
 
 const EARTH_RADIUS = 6378245.0
 const EE = 0.00669342162296594323
+const EPSILON = 1e-9
 
 const isOutsideChina = (lng: number, lat: number): boolean =>
   lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
@@ -111,10 +112,164 @@ export const closeRing = (ring: PolygonRing): PolygonRing => {
   return [...ring, [...first] as [number, number]]
 }
 
+const openRing = (ring: PolygonRing): PolygonRing => {
+  if (ring.length < 2) return [...ring]
+  const first = ring[0]
+  const last = ring[ring.length - 1]
+  if (first[0] === last[0] && first[1] === last[1]) {
+    return ring.slice(0, -1)
+  }
+  return [...ring]
+}
+
+const getSignedRingArea = (ring: PolygonRing): number => {
+  const vertices = openRing(ring)
+  if (vertices.length < 3) return 0
+
+  let area = 0
+  for (let index = 0; index < vertices.length; index += 1) {
+    const [x1, y1] = vertices[index]
+    const [x2, y2] = vertices[(index + 1) % vertices.length]
+    area += x1 * y2 - x2 * y1
+  }
+  return area / 2
+}
+
+const rotatePoint = ([x, y]: [number, number], angle: number): [number, number] => {
+  const cos = Math.cos(angle)
+  const sin = Math.sin(angle)
+  return [x * cos - y * sin, x * sin + y * cos]
+}
+
+const squaredDistance = ([x1, y1]: [number, number], [x2, y2]: [number, number]): number =>
+  (x1 - x2) ** 2 + (y1 - y2) ** 2
+
+const cross = (
+  [ox, oy]: [number, number],
+  [ax, ay]: [number, number],
+  [bx, by]: [number, number],
+): number => (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+
+const getConvexHull = (points: PolygonRing): PolygonRing => {
+  const uniquePoints = [...new Map(points.map((point) => [`${point[0]},${point[1]}`, point])).values()]
+    .sort((a, b) => (a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]))
+
+  if (uniquePoints.length <= 3) {
+    return uniquePoints
+  }
+
+  const lower: PolygonRing = []
+  for (const point of uniquePoints) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) {
+      lower.pop()
+    }
+    lower.push(point)
+  }
+
+  const upper: PolygonRing = []
+  for (let index = uniquePoints.length - 1; index >= 0; index -= 1) {
+    const point = uniquePoints[index]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) {
+      upper.pop()
+    }
+    upper.push(point)
+  }
+
+  lower.pop()
+  upper.pop()
+  return [...lower, ...upper]
+}
+
+const rotateRingStartToNearest = (
+  ring: PolygonRing,
+  targetPoint: [number, number],
+): PolygonRing => {
+  const vertices = openRing(ring)
+  if (vertices.length < 2) return ring
+
+  let startIndex = 0
+  let minDistance = Number.POSITIVE_INFINITY
+  vertices.forEach((point, index) => {
+    const distance = squaredDistance(point, targetPoint)
+    if (distance < minDistance) {
+      minDistance = distance
+      startIndex = index
+    }
+  })
+
+  const rotated = [...vertices.slice(startIndex), ...vertices.slice(0, startIndex)]
+  return closeRing(rotated)
+}
+
+const ensureRingOrientation = (ring: PolygonRing, shouldBeClockwise: boolean): PolygonRing => {
+  const isClockwise = getSignedRingArea(ring) < 0
+  if (isClockwise === shouldBeClockwise) {
+    return ring
+  }
+  return closeRing(openRing(ring).reverse())
+}
+
 export const normalizePolygonRings = (coordinates: Position[][]): PolygonRings =>
   coordinates
     .map((ring) => closeRing(ring.map((position) => [position[0], position[1]] as [number, number])))
     .filter((ring) => ring.length >= 4)
+
+export const getMinimumAreaBoundingRectangle = (ring: PolygonRing): PolygonRing | null => {
+  const vertices = openRing(ring)
+  if (vertices.length < 3) return null
+
+  const hull = getConvexHull(vertices)
+  if (hull.length < 3) return null
+
+  let bestRect:
+    | {
+        area: number
+        angle: number
+        minX: number
+        maxX: number
+        minY: number
+        maxY: number
+      }
+    | null = null
+
+  for (let index = 0; index < hull.length; index += 1) {
+    const current = hull[index]
+    const next = hull[(index + 1) % hull.length]
+    const edgeAngle = Math.atan2(next[1] - current[1], next[0] - current[0])
+
+    let minX = Number.POSITIVE_INFINITY
+    let maxX = Number.NEGATIVE_INFINITY
+    let minY = Number.POSITIVE_INFINITY
+    let maxY = Number.NEGATIVE_INFINITY
+
+    for (const point of hull) {
+      const [rotatedX, rotatedY] = rotatePoint(point, -edgeAngle)
+      minX = Math.min(minX, rotatedX)
+      maxX = Math.max(maxX, rotatedX)
+      minY = Math.min(minY, rotatedY)
+      maxY = Math.max(maxY, rotatedY)
+    }
+
+    const area = (maxX - minX) * (maxY - minY)
+    if (!bestRect || area < bestRect.area - EPSILON) {
+      bestRect = { area, angle: edgeAngle, minX, maxX, minY, maxY }
+    }
+  }
+
+  if (!bestRect) return null
+
+  const rectangle = closeRing(
+    [
+      [bestRect.minX, bestRect.minY],
+      [bestRect.maxX, bestRect.minY],
+      [bestRect.maxX, bestRect.maxY],
+      [bestRect.minX, bestRect.maxY],
+    ].map((point) => rotatePoint(point as [number, number], bestRect.angle)),
+  )
+
+  const orientedRectangle = ensureRingOrientation(rectangle, getSignedRingArea(ring) < 0)
+  return rotateRingStartToNearest(orientedRectangle, vertices[0])
+}
 
 export const geometryToSinglePolygonRings = (
   geometry: Polygon | MultiPolygon,
@@ -167,6 +322,15 @@ export const getBoundsFromGeometry = (geometry: Polygon | MultiPolygon): BBox | 
   if (!rings) return null
   return getBoundsFromRings(rings)
 }
+
+export const translatePolygonRings = (
+  rings: PolygonRings,
+  deltaLng: number,
+  deltaLat: number,
+): PolygonRings =>
+  rings.map((ring) =>
+    ring.map(([lng, lat]) => [lng + deltaLng, lat + deltaLat] as [number, number]),
+  )
 
 export const expandBounds = (bbox: BBox, padding: number): BBox => [
   bbox[0] - padding,
