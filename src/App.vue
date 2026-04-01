@@ -102,7 +102,7 @@ const CANDIDATE_SELECTED_STYLE = {
   zIndex: 100,
 }
 
-const BUILDING_LAYER_MIN_ZOOM = 15
+const BUILDING_LAYER_MIN_ZOOM = 12
 const BUILDING_LAYER_RENDER_LIMIT = 1800
 const BUILDING_LAYER_BOUNDS_PADDING = 0.01
 const SURFACE_DRAG_HANDLE_OFFSET_PX = 44
@@ -1645,11 +1645,18 @@ onMounted(async () => {
     })
 
     map = new mapApi.Map(mapContainer.value, {
-      viewMode: '3D',
+      // 使用俯视平面视图，避免 3D 楼块屋顶带来的面积放大与偏移
+      viewMode: '2D',
       zoom: 12,
       center: [120.66748, 31.292582],
       mapStyle: amapMapStyle,
       doubleClickZoom: false,
+      showBuildingBlock: true,
+      features: ['bg', 'road', 'point', 'building'],
+      pitch: 0,
+      rotation: 0,
+      pitchEnable: false,
+      rotateEnable: false,
     })
 
     currentMapZoom.value = map.getZoom()
