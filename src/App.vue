@@ -109,7 +109,7 @@ const SURFACE_DRAG_HANDLE_OFFSET_PX = 44
 const SURFACE_REGULARIZE_OPTIONS = {
   angleSnapDeg: 10,
   lineSnapDistanceMeters: 0.8,
-  maxMoveRatio: 1,
+  maxMoveRatio: 0.3,
 }
 
 const amapKey = import.meta.env.VITE_AMAP_KEY as string | undefined
