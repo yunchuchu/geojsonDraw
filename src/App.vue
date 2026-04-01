@@ -113,10 +113,12 @@ const amapMapStyle =
 const amapSecurityJsCode = import.meta.env.VITE_AMAP_SECURITY_JS_CODE as string | undefined
 
 const mapContainer = ref<HTMLElement | null>(null)
+const searchInputRef = ref<HTMLInputElement | null>(null)
 const searchQuery = ref('')
 const isSearching = ref(false)
 const searchError = ref('')
 const searchTips = ref<SearchTip[]>([])
+const searchSuggestionsStyle = ref<Record<string, string>>({})
 const drawMode = ref<DrawMode>('none')
 const selectedFeatureId = ref<string | null>(null)
 const selectedBuildingCandidateIds = ref<string[]>([])
@@ -131,7 +133,7 @@ const geojsonText = ref(
     2,
   ),
 )
-const feedback = ref('请先选择绘制模式（点/面），然后在地图上操作。')
+const feedback = ref('提示：双击地图空白处也可自动开始绘制。')
 
 const isExportModalOpen = ref(false)
 const showGeojsonText = ref(false)
@@ -1341,7 +1343,7 @@ const parseLocation = (location?: string): [number, number] | null => {
 
 const focusSearchLocation = (lng: number, lat: number): void => {
   if (!map) return
-  const zoom = Math.max(15, Math.min(17, map.getZoom()))
+  const zoom = 17
   map.setZoomAndCenter(zoom, [lng, lat])
 }
 
@@ -1392,6 +1394,16 @@ const clearSearchTips = (): void => {
   searchTips.value = []
 }
 
+const updateSearchSuggestionsPosition = (): void => {
+  if (!searchInputRef.value) return
+  const rect = searchInputRef.value.getBoundingClientRect()
+  searchSuggestionsStyle.value = {
+    left: `${rect.left}px`,
+    top: `${rect.bottom + 6}px`,
+    width: `${rect.width}px`,
+  }
+}
+
 const handleSearchInput = (): void => {
   const query = searchQuery.value.trim()
   searchError.value = ''
@@ -1405,6 +1417,8 @@ const handleSearchInput = (): void => {
     clearSearchTips()
     return
   }
+
+  requestAnimationFrame(updateSearchSuggestionsPosition)
 
   suggestionTimer = window.setTimeout(async () => {
     const requestSeq = ++suggestionRequestSeq
@@ -1441,6 +1455,15 @@ const handleSearchInput = (): void => {
     }
   }, 250)
 }
+
+watch(
+  searchTips,
+  () => {
+    if (!searchTips.value.length) return
+    requestAnimationFrame(updateSearchSuggestionsPosition)
+  },
+  { deep: true },
+)
 
 const selectSearchTip = (tip: SearchTip): void => {
   searchQuery.value = tip.name
@@ -1515,6 +1538,9 @@ onMounted(async () => {
   }
 
   try {
+    window.addEventListener('resize', updateSearchSuggestionsPosition)
+    window.addEventListener('scroll', updateSearchSuggestionsPosition, true)
+
     if (amapSecurityJsCode) {
       ;(window as Window & { _AMapSecurityConfig?: { securityJsCode: string } })._AMapSecurityConfig =
         {
@@ -1530,9 +1556,10 @@ onMounted(async () => {
 
     map = new mapApi.Map(mapContainer.value, {
       viewMode: '3D',
-      zoom: 11,
-      center: [121.4737, 31.2304],
+      zoom: 12,
+      center: [120.66748, 31.292582],
       mapStyle: amapMapStyle,
+      doubleClickZoom: false,
     })
 
     currentMapZoom.value = map.getZoom()
@@ -1577,6 +1604,8 @@ onUnmounted(() => {
     suggestionTimer = null
   }
   window.removeEventListener('keydown', handleWindowKeydown)
+  window.removeEventListener('resize', updateSearchSuggestionsPosition)
+  window.removeEventListener('scroll', updateSearchSuggestionsPosition, true)
 
   stopDrawing()
   stopPolygonEditing()
@@ -1599,93 +1628,118 @@ onUnmounted(() => {
   <main class="app-shell">
     <div ref="mapContainer" class="map-canvas" aria-label="地图绘制区域"></div>
 
-    <header class="top-bar">
-      <div class="brand">
-        <h1>GeoJSON 建筑面提取工具</h1>
-        <p>底图：高德 JSAPI 2.0（Loader 初始化）</p>
-      </div>
+    <div class="chrome-layer">
+      <header class="top-strip">
+        <div class="top-strip-left">
+          <h1 class="app-title">GeoJson 建筑面工具</h1>
+        </div>
 
-      <div class="search-bar">
-        <div class="search-input-wrap">
+        <div class="search-input-wrap header-search-wrap">
+          <svg
+            class="search-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
           <input
+            ref="searchInputRef"
             v-model="searchQuery"
             type="text"
             class="search-input"
-            placeholder="输入地名、地址或关键词，按回车或点击搜索"
+            placeholder="输入地名、地址或关键词"
             @input="handleSearchInput"
             @keyup.enter="handleSearch"
           />
-          <ul v-if="searchTips.length" class="search-suggestions">
-            <li v-for="(tip, idx) in searchTips" :key="`${tip.name}-${idx}`">
-              <button type="button" class="search-suggestion-item" @click="selectSearchTip(tip)">
-                <span class="tip-name">{{ tip.name }}</span>
-                <span class="tip-meta">{{ [tip.district, tip.address].filter(Boolean).join(' ') }}</span>
-              </button>
-            </li>
-          </ul>
         </div>
+
+        <div class="top-strip-right">
+          <button
+            type="button"
+            class="btn btn-secondary export-trigger"
+            @click="isExportModalOpen = true"
+          >
+            导出
+          </button>
+        </div>
+      </header>
+
+      <Teleport to="body">
+        <ul
+          v-if="searchTips.length"
+          class="search-suggestions search-suggestions-portal"
+          :style="searchSuggestionsStyle"
+        >
+          <li v-for="(tip, idx) in searchTips" :key="`${tip.name}-${idx}`">
+            <button type="button" class="search-suggestion-item" @click="selectSearchTip(tip)">
+              <span class="tip-name">{{ tip.name }}</span>
+              <span class="tip-meta">
+                {{ [tip.district, tip.address].filter(Boolean).join(' ') }}
+              </span>
+            </button>
+          </li>
+        </ul>
+      </Teleport>
+
+      <aside class="tool-panel" aria-label="建筑面绘制与候选控制区">
         <button
           type="button"
-          class="btn btn-primary search-button"
-          :disabled="isSearching"
-          @click="handleSearch"
+          class="btn block-btn"
+          :class="drawMode === 'polygon' ? 'btn-primary' : 'btn-ghost'"
+          @click="toggleDrawPolygon"
         >
-          {{ isSearching ? '搜索中…' : '搜索' }}
+          {{ drawMode === 'polygon' ? '完成绘制' : '绘制建筑面' }}
         </button>
-      </div>
 
-      <button type="button" class="btn btn-primary export-trigger" @click="isExportModalOpen = true">
-        导出 GeoJSON
-      </button>
-    </header>
+        <button
+          type="button"
+          class="btn block-btn"
+          :class="isBuildingLayerVisible ? 'btn-primary' : 'btn-ghost'"
+          :disabled="isBuildingDataLoading"
+          @click="toggleBuildingLayer"
+        >
+          {{
+            isBuildingDataLoading
+              ? '加载建筑面…'
+              : isBuildingLayerVisible
+                ? '隐藏建筑候选'
+                : '显示建筑候选'
+          }}
+        </button>
 
-    <div class="draw-actions-panel">
-      <button
-        type="button"
-        class="btn"
-        :class="drawMode === 'polygon' ? 'btn-primary' : 'btn-ghost'"
-        @click="toggleDrawPolygon"
-      >
-        {{ drawMode === 'polygon' ? '完成绘制' : '绘制面' }}
-      </button>
-
-      <button
-        type="button"
-        class="btn"
-        :class="isBuildingLayerVisible ? 'btn-primary' : 'btn-ghost'"
-        :disabled="isBuildingDataLoading"
-        @click="toggleBuildingLayer"
-      >
-        {{ isBuildingDataLoading ? '加载建筑面…' : isBuildingLayerVisible ? '隐藏建筑面' : '显示建筑面' }}
-      </button>
-      <button
-        type="button"
-        class="btn btn-ghost"
-        :disabled="!isBuildingLayerReady || !canUseBuildingLayerAtCurrentZoom"
-        @click="startRectangleSelectBuildings"
-      >
-        框选建筑
-      </button>
-      <button
-        type="button"
-        class="btn btn-ghost"
-        :disabled="!selectedBuildingCandidateCount"
-        @click="addSelectedBuildingCandidates"
-      >
-        添加选中建筑
-      </button>
-      <button
-        type="button"
-        class="btn btn-ghost"
-        :disabled="!selectedBuildingCandidateCount"
-        @click="clearBuildingCandidateSelection"
-      >
-        清空候选选择
-      </button>
-
-      <p class="candidate-status">
-        {{ buildingLayerStatus }}
-      </p>
+        <button
+          type="button"
+          class="btn btn-ghost block-btn"
+          :disabled="!isBuildingLayerReady || !canUseBuildingLayerAtCurrentZoom"
+          @click="startRectangleSelectBuildings"
+        >
+          框选建筑
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost block-btn"
+          :disabled="!selectedBuildingCandidateCount"
+          @click="addSelectedBuildingCandidates"
+        >
+          加入选中建筑
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost block-btn"
+          :disabled="!selectedBuildingCandidateCount"
+          @click="clearBuildingCandidateSelection"
+        >
+          清空候选选择
+        </button>
+        <p class="candidate-status">
+          {{ buildingLayerStatus }}
+        </p>
+      </aside>
     </div>
 
     <p class="feedback-toast">
@@ -1752,3 +1806,489 @@ onUnmounted(() => {
     </div>
   </main>
 </template>
+
+<style scoped>
+.app-shell {
+  position: relative;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+  color: #0f172a;
+  background:
+    radial-gradient(circle at 20% 20%, rgba(148, 163, 184, 0.2), transparent 55%),
+    radial-gradient(circle at 80% 80%, rgba(191, 219, 254, 0.3), transparent 55%),
+    #f9fafb;
+  overflow: visible;
+}
+
+.map-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+.chrome-layer {
+  position: relative;
+  z-index: 1000;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.top-strip {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  column-gap: 16px;
+  overflow: hidden;
+  width: min(720px, 100% - 32px);
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.82), rgba(248, 250, 252, 0.9));
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow:
+    0 18px 45px rgba(15, 23, 42, 0.08),
+    0 0 0 1px rgba(148, 163, 184, 0.2);
+  backdrop-filter: blur(26px) saturate(170%);
+  -webkit-backdrop-filter: blur(26px) saturate(170%);
+  pointer-events: auto;
+}
+
+.top-strip-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.app-title {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: #0f172a;
+  white-space: nowrap;
+}
+
+.top-strip-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+}
+
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.header-search-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 260px;
+  max-width: 440px;
+  overflow: visible;
+  z-index: 80;
+}
+
+.search-input-wrap {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: #94a3b8;
+  pointer-events: none;
+}
+
+.search-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 32px;
+  padding: 0 12px 0 32px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  background: radial-gradient(circle at 10% 0%, rgba(255, 255, 255, 0.95), rgba(248, 250, 252, 0.96));
+  color: #0f172a;
+  font-size: 13px;
+  outline: none;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    background-color 150ms ease;
+}
+
+.search-input::placeholder {
+  color: rgba(148, 163, 184, 0.9);
+}
+
+.search-input:focus {
+  border-color: rgba(59, 130, 246, 0.9);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+
+.search-suggestions {
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: rgba(255, 255, 255, 0.98);
+  border-radius: 14px;
+  border: 1px solid rgba(191, 219, 254, 0.9);
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.09);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  z-index: 1300;
+  pointer-events: auto;
+}
+
+.search-suggestions-portal {
+  position: fixed;
+  z-index: 1400;
+}
+
+.search-suggestion-item {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: none;
+  background: transparent;
+  color: #0f172a;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    transform 150ms ease;
+}
+
+.search-suggestion-item:hover {
+  background: radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.08), rgba(248, 250, 252, 1));
+  transform: translateY(-1px);
+}
+
+.tip-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.tip-meta {
+  margin-top: 1px;
+  font-size: 11px;
+  color: #6b7280;
+}
+
+.btn {
+  box-sizing: border-box;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  height: 32px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  cursor: pointer;
+  white-space: nowrap;
+  background: transparent;
+  color: #0f172a;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 120ms ease;
+}
+
+.btn-primary {
+  background: radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.92), rgba(37, 99, 235, 1));
+  border-color: rgba(59, 130, 246, 1);
+  box-shadow:
+    0 10px 26px rgba(37, 99, 235, 0.35),
+    0 0 0 1px rgba(15, 23, 42, 0.02);
+  color: #f9fafb;
+}
+
+.btn-secondary {
+  background: radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.92), rgba(37, 99, 235, 1));
+  border-color: rgba(59, 130, 246, 1);
+  box-shadow:
+    0 10px 26px rgba(37, 99, 235, 0.35),
+    0 0 0 1px rgba(15, 23, 42, 0.02);
+  color: #f9fafb;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.98), rgba(37, 99, 235, 1));
+}
+
+.btn-ghost {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(209, 213, 219, 0.9);
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow:
+    0 14px 34px rgba(15, 23, 42, 0.08),
+    0 0 0 1px rgba(148, 163, 184, 0.35);
+}
+
+button.btn.export-trigger {
+  width: 73px;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: radial-gradient(circle at 0 0, rgba(59, 130, 246, 0.98), rgba(37, 99, 235, 1));
+}
+
+.btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+  box-shadow: none;
+}
+
+
+.tool-panel {
+  position: absolute;
+  top: 78px;
+  left: 16px;
+  width: 220px;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.tool-panel .btn {
+  border-radius: 8px;
+}
+
+.block-btn {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.block-btn + .block-btn {
+  margin-top: 2px;
+}
+
+.candidate-status {
+  margin: 4px 2px 0;
+  padding: 1px 6px;
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1.4;
+  color: rgba(133, 77, 14, 0.82);
+  max-width: 100%;
+  background: rgba(249, 250, 251, 0.9);
+  border-radius: 2px;
+  border: none;
+}
+
+.feedback-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: min(520px, 100% - 32px);
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: radial-gradient(circle at 0 0, rgba(234, 179, 8, 0.12), rgba(248, 250, 252, 0.98));
+  border: 1px solid rgba(234, 179, 8, 0.7);
+  color: #854d0e;
+  font-size: 12px;
+  text-align: center;
+  box-shadow:
+    0 10px 26px rgba(15, 23, 42, 0.12),
+    0 0 0 1px rgba(148, 163, 184, 0.3);
+  z-index: 15;
+}
+
+.search-error {
+  position: absolute;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(254, 242, 242, 0.96);
+  border: 1px solid rgba(248, 113, 113, 0.9);
+  color: #991b1b;
+  font-size: 12px;
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.9);
+  z-index: 20;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at 10% 0, rgba(15, 23, 42, 0.1), rgba(15, 23, 42, 0.18));
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  z-index: 40;
+}
+
+.modal {
+  width: min(720px, 100% - 40px);
+  max-height: min(640px, 100% - 80px);
+  border-radius: 20px;
+  background:
+    radial-gradient(circle at 0 0, rgba(56, 189, 248, 0.18), transparent 65%),
+    #ffffff;
+  border: 1px solid rgba(191, 219, 254, 0.9);
+  box-shadow:
+    0 26px 60px rgba(15, 23, 42, 0.95),
+    0 0 0 1px rgba(15, 23, 42, 0.9);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px 10px;
+  border-bottom: 1px solid rgba(30, 64, 175, 0.7);
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.modal-close {
+  border: none;
+  background: transparent;
+  color: #6b7280;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.modal-body {
+  padding: 14px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12px;
+  color: #4b5563;
+}
+
+.coord-switch {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #111827;
+}
+
+.section-label {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.coord-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.toggle-geojson {
+  align-self: flex-start;
+}
+
+.geojson-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.textarea-label {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.geojson-output {
+  width: 100%;
+  min-height: 220px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(191, 219, 254, 0.9);
+  background: radial-gradient(circle at 0 0, rgba(248, 250, 252, 0.98), rgba(255, 255, 255, 0.98));
+  color: #0f172a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
+    monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+@media (max-width: 900px) {
+  .top-strip {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .top-strip-right {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .tool-panel {
+    top: auto;
+    bottom: 18px;
+    left: 16px;
+    right: auto;
+    width: 220px;
+  }
+}
+</style>
