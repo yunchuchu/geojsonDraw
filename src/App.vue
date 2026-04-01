@@ -377,25 +377,31 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
 
   handleMarker.setMap(map)
 
-  const startDrag = (): void => {
+  const startDrag = (downEvent: MouseEvent): void => {
     const feature = getSurfaceFeatureById(selected.id)
     const rings = feature ? geometryToSinglePolygonRings(feature.geometry) : null
     if (!rings) return
 
     surfaceDragStartPosition = toLngLatPair(handleMarker.getPosition())
+    const dragStartMousePosition =
+      getLngLatFromClientPoint(downEvent.clientX, downEvent.clientY) ?? surfaceDragStartPosition
     surfaceDragStartRings = rings.map((ring) => ring.map(([lng, lat]) => [lng, lat] as [number, number]))
     polygonEditor?.close()
     polygonEditor = null
     map?.setDefaultCursor('grabbing')
+    let latestDeltaLng = 0
+    let latestDeltaLat = 0
 
     const handleMove = (moveEvent: MouseEvent): void => {
       if (!surfaceDragStartPosition || !surfaceDragStartRings) return
 
-      const nextPosition = getLngLatFromClientPoint(moveEvent.clientX, moveEvent.clientY)
-      if (!nextPosition) return
+      const nextMousePosition = getLngLatFromClientPoint(moveEvent.clientX, moveEvent.clientY)
+      if (!nextMousePosition) return
 
-      const deltaLng = nextPosition[0] - surfaceDragStartPosition[0]
-      const deltaLat = nextPosition[1] - surfaceDragStartPosition[1]
+      const deltaLng = nextMousePosition[0] - dragStartMousePosition[0]
+      const deltaLat = nextMousePosition[1] - dragStartMousePosition[1]
+      latestDeltaLng = deltaLng
+      latestDeltaLat = deltaLat
       const nextRings = translatePolygonRings(surfaceDragStartRings, deltaLng, deltaLat)
       const nextGeometry = getSurfaceGeometryFromRings(
         selected.geometryType as SurfaceGeometryType,
@@ -405,13 +411,15 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
       if (!nextPath) return
 
       selected.overlay.setPath(nextPath)
-      handleMarker.setPosition(nextPosition)
+      handleMarker.setPosition([
+        surfaceDragStartPosition[0] + deltaLng,
+        surfaceDragStartPosition[1] + deltaLat,
+      ])
     }
 
     const handleUp = (upEvent: MouseEvent): void => {
       const currentFeature = getSurfaceFeatureById(selected.id)
-      const nextPosition = getLngLatFromClientPoint(upEvent.clientX, upEvent.clientY)
-      const safePosition = nextPosition ?? toLngLatPair(handleMarker.getPosition())
+      const nextMousePosition = getLngLatFromClientPoint(upEvent.clientX, upEvent.clientY)
 
       if (!surfaceDragStartPosition || !surfaceDragStartRings) {
         surfaceDragPointerCleanup?.()
@@ -421,8 +429,14 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
         return
       }
 
-      const deltaLng = safePosition[0] - surfaceDragStartPosition[0]
-      const deltaLat = safePosition[1] - surfaceDragStartPosition[1]
+      const deltaLng =
+        nextMousePosition?.[0] !== undefined
+          ? nextMousePosition[0] - dragStartMousePosition[0]
+          : latestDeltaLng
+      const deltaLat =
+        nextMousePosition?.[1] !== undefined
+          ? nextMousePosition[1] - dragStartMousePosition[1]
+          : latestDeltaLat
       const nextRings = translatePolygonRings(surfaceDragStartRings, deltaLng, deltaLat)
       const nextGeometry = getSurfaceGeometryFromRings(
         selected.geometryType as SurfaceGeometryType,
@@ -726,7 +740,26 @@ const startEditSelected = (): void => {
   stopDrawing()
   stopPolygonEditing()
 
-  polygonEditor = new mapApi.PolygonEditor(map, selected.overlay)
+  polygonEditor = new mapApi.PolygonEditor(map, selected.overlay, {
+    editOptions: {
+      strokeColor: SELECTED_SURFACE_STYLE.strokeColor,
+      strokeWeight: 2,
+      fillColor: SELECTED_SURFACE_STYLE.fillColor,
+      fillOpacity: 0.18,
+    },
+    controlPoint: {
+      // 非常浅的蓝色实心点，看起来不抢眼
+      fillColor: '#dbeafe',
+      strokeColor: '#60a5fa',
+      strokeWeight: 1,
+    },
+    midControlPoint: {
+      // 中点弱化：接近背景的填充 + 很浅的蓝色边框
+      fillColor: '#f8fafc',
+      strokeColor: '#93c5fd',
+      strokeWeight: 1,
+    },
+  })
   const syncPolygon = () => {
     const currentFeature = features.find((feature) => String(feature.id) === selected.id)
     if (!currentFeature || currentFeature.geometry.type === 'Point') {
