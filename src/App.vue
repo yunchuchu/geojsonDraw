@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import AMapLoader from '@amap/amap-jsapi-loader'
 import buildingGeojsonUrl from './assets/sz84.geojson?url'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import SurfaceWorkbench from './components/SurfaceWorkbench.vue'
+import { computed, createApp, onMounted, onUnmounted, ref, watch } from 'vue'
 import type {
   Feature,
   FeatureCollection,
@@ -25,6 +26,7 @@ import {
   type PolygonRing,
   type PolygonRings,
 } from './utils/geometry'
+import { regularizePolygonRing } from './utils/regularize'
 
 type DrawMode = 'none' | 'polygon' | 'building-rectangle'
 type ExportCoordinateSystem = CoordinateSystem
@@ -104,6 +106,11 @@ const BUILDING_LAYER_MIN_ZOOM = 15
 const BUILDING_LAYER_RENDER_LIMIT = 1800
 const BUILDING_LAYER_BOUNDS_PADDING = 0.01
 const SURFACE_DRAG_HANDLE_OFFSET_PX = 44
+const SURFACE_REGULARIZE_OPTIONS = {
+  angleSnapDeg: 10,
+  lineSnapDistanceMeters: 0.8,
+  maxMoveRatio: 1,
+}
 
 const amapKey = import.meta.env.VITE_AMAP_KEY as string | undefined
 const amapSearchKey =
@@ -154,6 +161,7 @@ let surfaceDragHandleMarker: any | null = null
 let surfaceDragStartPosition: [number, number] | null = null
 let surfaceDragStartRings: PolygonRings | null = null
 let surfaceDragPointerCleanup: (() => void) | null = null
+let surfaceWorkbenchUnmount: (() => void) | null = null
 
 const overlays = new Map<string, StoredOverlay>()
 const buildingCandidatesById = new Map<string, CandidateBuilding>()
@@ -186,6 +194,7 @@ const selectedBuildingCandidateLookup = computed(
 const isBuildingLayerReady = computed(
   () => isBuildingLayerVisible.value && hasBuildingDataLoaded.value && !isBuildingDataLoading.value,
 )
+const regularizeThreshold = ref(SURFACE_REGULARIZE_OPTIONS.maxMoveRatio)
 const canUseBuildingLayerAtCurrentZoom = computed(
   () => currentMapZoom.value >= BUILDING_LAYER_MIN_ZOOM,
 )
@@ -323,6 +332,8 @@ const getLngLatFromClientPoint = (clientX: number, clientY: number): [number, nu
 const teardownSurfaceDragHandle = (): void => {
   surfaceDragPointerCleanup?.()
   surfaceDragPointerCleanup = null
+  surfaceWorkbenchUnmount?.()
+  surfaceWorkbenchUnmount = null
   if (surfaceDragHandleMarker && map) {
     map.remove(surfaceDragHandleMarker)
   }
@@ -354,34 +365,6 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
   teardownSurfaceDragHandle()
 
   const workbench = document.createElement('div')
-  workbench.className = 'surface-workbench'
-
-  const dragButton = document.createElement('button')
-  dragButton.type = 'button'
-  dragButton.className = 'surface-workbench__drag'
-  dragButton.setAttribute('aria-label', '拖拽选中面')
-  dragButton.title = '拖拽'
-  dragButton.textContent = '拖拽'
-
-  const flattenButton = document.createElement('button')
-  flattenButton.type = 'button'
-  flattenButton.className = 'surface-workbench__action'
-  flattenButton.title = '规整'
-  flattenButton.textContent = '规整'
-
-  const deleteButton = document.createElement('button')
-  deleteButton.type = 'button'
-  deleteButton.className = 'surface-workbench__action surface-workbench__action--danger'
-  deleteButton.title = '删除'
-  deleteButton.textContent = '删除'
-
-  const finishButton = document.createElement('button')
-  finishButton.type = 'button'
-  finishButton.className = 'surface-workbench__action'
-  finishButton.title = '完成'
-  finishButton.textContent = '完成'
-
-  workbench.append(dragButton, flattenButton, deleteButton, finishButton)
 
   const handleMarker = new mapApi.Marker({
     position,
@@ -394,10 +377,7 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
 
   handleMarker.setMap(map)
 
-  const startDrag = (event: MouseEvent): void => {
-    event.preventDefault()
-    event.stopPropagation()
-
+  const startDrag = (): void => {
     const feature = getSurfaceFeatureById(selected.id)
     const rings = feature ? geometryToSinglePolygonRings(feature.geometry) : null
     if (!rings) return
@@ -485,23 +465,28 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
     }
   }
 
-  dragButton.addEventListener('mousedown', startDrag)
-  flattenButton.addEventListener('click', (event) => {
-    event.preventDefault()
-    event.stopPropagation()
-    flattenSelectedSurface()
+  const workbenchApp = createApp(SurfaceWorkbench, {
+    initialRegularizeThreshold: regularizeThreshold.value,
+    onDragStart: startDrag,
+    onCopy: () => {
+      copySelectedFeature()
+    },
+    onFlatten: (threshold: number) => {
+      regularizeThreshold.value = threshold
+      flattenSelectedSurface(threshold)
+    },
+    onRemove: () => {
+      deleteSelected()
+    },
+    onFinish: () => {
+      stopPolygonEditing()
+      feedback.value = '已结束当前面的编辑。'
+    },
   })
-  deleteButton.addEventListener('click', (event) => {
-    event.preventDefault()
-    event.stopPropagation()
-    deleteSelected()
-  })
-  finishButton.addEventListener('click', (event) => {
-    event.preventDefault()
-    event.stopPropagation()
-    stopPolygonEditing()
-    feedback.value = '已结束当前面的编辑。'
-  })
+  workbenchApp.mount(workbench)
+  surfaceWorkbenchUnmount = () => {
+    workbenchApp.unmount()
+  }
 
   surfaceDragHandleMarker = handleMarker
 }
@@ -766,10 +751,10 @@ const startEditSelected = (): void => {
   polygonEditor.open()
   setupSurfaceDragHandle(selected)
   isEditingSelected.value = true
-  feedback.value = '面编辑模式已开启：可在上方工作区拖拽、规整、删除或完成。'
+  feedback.value = '面编辑模式已开启：可在上方工作区复制、规整、拖拽、删除或完成。'
 }
 
-const flattenSelectedSurface = (): void => {
+const flattenSelectedSurface = (threshold: number = regularizeThreshold.value): void => {
   if (!selectedFeatureId.value) {
     feedback.value = '请先选中一个面要素。'
     return
@@ -793,9 +778,14 @@ const flattenSelectedSurface = (): void => {
     return
   }
 
-  const flattenedOuterRing = getMinimumAreaBoundingRectangle(rings[0])
+  const regularizedOuterRing = regularizePolygonRing(rings[0], {
+    ...SURFACE_REGULARIZE_OPTIONS,
+    maxMoveRatio: threshold,
+    lineSnapDistanceMeters: SURFACE_REGULARIZE_OPTIONS.lineSnapDistanceMeters * (1 + threshold * 2),
+  })
+  const flattenedOuterRing = regularizedOuterRing ?? getMinimumAreaBoundingRectangle(rings[0])
   if (!flattenedOuterRing) {
-    feedback.value = '当前面形状不足以进行平整。'
+    feedback.value = '当前面形状不足以进行智能规整。'
     return
   }
 
@@ -824,7 +814,9 @@ const flattenSelectedSurface = (): void => {
     startEditSelected()
   }
 
-  feedback.value = '已将选中面平整为最小外接矩形。'
+  feedback.value = regularizedOuterRing
+    ? '已智能规整选中面（共线/平行约束）。'
+    : '已退回最小外接矩形规整（智能规整未收敛）。'
 }
 
 const addPolygonFeature = (polygon: any): void => {
@@ -1170,6 +1162,71 @@ const deleteSelected = (): void => {
   }
   removeFeatureById(selectedFeatureId.value)
   feedback.value = '选中要素已删除。'
+}
+
+const copySelectedFeature = (): void => {
+  if (!selectedFeatureId.value) {
+    feedback.value = '请先选中一个面要素。'
+    return
+  }
+
+  const selected = overlays.get(selectedFeatureId.value)
+  if (!selected || selected.kind !== 'export-surface') {
+    feedback.value = '当前选中要素不是面，无法复制。'
+    return
+  }
+
+  const currentFeature = features.find((feature) => String(feature.id) === selected.id)
+  if (!currentFeature || currentFeature.geometry.type === 'Point') {
+    feedback.value = '当前选中要素不是面，无法复制。'
+    return
+  }
+
+  const bounds = getBoundsFromGeometry(currentFeature.geometry)
+  if (!bounds) {
+    feedback.value = '复制失败：当前面边界无效。'
+    return
+  }
+  const [minLng, minLat, maxLng, maxLat] = bounds
+  const lngSpan = Math.abs(maxLng - minLng)
+  const latSpan = Math.abs(maxLat - minLat)
+  const offsetLng = Math.max(lngSpan * 0.12, 0.00003)
+  const offsetLat = Math.max(latSpan * 0.12, 0.00003)
+
+  const nextGeometry: SurfaceGeometry =
+    currentFeature.geometry.type === 'Polygon'
+      ? {
+          type: 'Polygon',
+          coordinates: currentFeature.geometry.coordinates.map((ring) =>
+            ring.map((position) => [position[0] + offsetLng, position[1] + offsetLat] as [number, number]),
+          ),
+        }
+      : {
+          type: 'MultiPolygon',
+          coordinates: currentFeature.geometry.coordinates.map((polygon) =>
+            polygon.map((ring) =>
+              ring.map((position) => [position[0] + offsetLng, position[1] + offsetLat] as [number, number]),
+            ),
+          ),
+        }
+
+  const copiedFeature: ExportFeature = {
+    ...currentFeature,
+    id: createFeatureId(),
+    properties: {
+      ...(currentFeature.properties ?? {}),
+    },
+    geometry: nextGeometry,
+  }
+
+  registerExportFeature(copiedFeature)
+  features = [...features, copiedFeature]
+  syncExportedBuildingSourceIds()
+  syncGeojson()
+  refreshVisibleBuildingCandidates()
+  setSelectedFeature(String(copiedFeature.id))
+  startEditSelected()
+  feedback.value = '已复制选中面要素（已偏移），并进入复制体编辑。'
 }
 
 const copyGeojson = async (): Promise<void> => {
