@@ -157,12 +157,23 @@ body,
   z-index: 10;
   display: grid;
   gap: 8px;
-  width: min(200px, 44vw);
+  width: min(220px, 46vw);
 }
 
 .draw-actions-panel .btn {
   min-height: 40px;
   font-size: 13px;
+}
+
+.candidate-status {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, #ffffff 90%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .stats {
@@ -185,6 +196,33 @@ body,
   display: grid;
   grid-template-columns: 1fr;
   gap: 8px;
+}
+
+.coord-switch {
+  display: grid;
+  gap: 8px;
+}
+
+.section-label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.coord-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+  color: var(--text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.coord-option input {
+  margin: 0;
 }
 
 .toggle-geojson {

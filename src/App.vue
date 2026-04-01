@@ -1,9 +1,37 @@
 <script setup lang="ts">
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import type { Feature, FeatureCollection, Point, Polygon } from 'geojson'
+import buildingGeojsonUrl from './assets/sz84.geojson?url'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import type {
+  Feature,
+  FeatureCollection,
+  GeoJsonProperties,
+  MultiPolygon,
+  Point,
+  Polygon,
+} from 'geojson'
+import {
+  bboxIntersects,
+  closeRing,
+  expandBounds,
+  geometryToAmapPath,
+  geometryToSinglePolygonRings,
+  getBoundsFromGeometry,
+  transformFeatureCoordinates,
+  type BBox,
+  type CoordinateSystem,
+  type PolygonRings,
+} from './utils/geometry'
 
-type DrawMode = 'none' | 'point' | 'polygon'
+type DrawMode = 'none' | 'point' | 'polygon' | 'building-rectangle'
+type ExportCoordinateSystem = CoordinateSystem
+type SurfaceGeometry = Polygon | MultiPolygon
+type ExportGeometry = Point | SurfaceGeometry
+type ExportFeature = Feature<ExportGeometry, GeoJsonProperties>
+type ExportFeatureCollection = FeatureCollection<ExportGeometry, GeoJsonProperties>
+type SurfaceGeometryType = SurfaceGeometry['type']
+type OverlayKind = 'export-point' | 'export-surface'
+type OverlaySource = 'manual' | 'building-import'
 
 type SearchTip = {
   name: string
@@ -23,23 +51,55 @@ type AmapPlacePoi = {
 
 type StoredOverlay = {
   id: string
-  type: 'Point' | 'Polygon'
+  kind: OverlayKind
+  source: OverlaySource
+  geometryType: ExportGeometry['type']
   overlay: any
 }
 
-const POLYGON_DEFAULT_STYLE = {
+type CandidateBuilding = {
+  id: string
+  geometryType: SurfaceGeometryType
+  geometry: SurfaceGeometry
+  properties: GeoJsonProperties
+  bbox: BBox
+}
+
+const EXPORT_SURFACE_STYLE = {
   strokeColor: '#2563eb',
   strokeWeight: 2,
   fillColor: '#3b82f6',
-  fillOpacity: 0.2,
+  fillOpacity: 0.24,
+  zIndex: 130,
 }
 
-const POLYGON_SELECTED_STYLE = {
-  strokeColor: '#ef4444',
+const SELECTED_SURFACE_STYLE = {
+  strokeColor: '#ca8a04',
   strokeWeight: 3,
-  fillColor: '#f97316',
-  fillOpacity: 0.3,
+  fillColor: '#fde047',
+  fillOpacity: 0.4,
+  zIndex: 320,
 }
+
+const CANDIDATE_SURFACE_STYLE = {
+  strokeColor: '#6b7280',
+  strokeWeight: 1.5,
+  fillColor: '#94a3b8',
+  fillOpacity: 0.2,
+  zIndex: 90,
+}
+
+const CANDIDATE_SELECTED_STYLE = {
+  strokeColor: '#7c3aed',
+  strokeWeight: 2,
+  fillColor: '#a78bfa',
+  fillOpacity: 0.28,
+  zIndex: 100,
+}
+
+const BUILDING_LAYER_MIN_ZOOM = 15
+const BUILDING_LAYER_RENDER_LIMIT = 1800
+const BUILDING_LAYER_BOUNDS_PADDING = 0.01
 
 const amapKey = import.meta.env.VITE_AMAP_KEY as string | undefined
 const amapSearchKey =
@@ -55,6 +115,8 @@ const searchError = ref('')
 const searchTips = ref<SearchTip[]>([])
 const drawMode = ref<DrawMode>('none')
 const selectedFeatureId = ref<string | null>(null)
+const selectedBuildingCandidateIds = ref<string[]>([])
+const exportCoordinateSystem = ref<ExportCoordinateSystem>('gcj02')
 const geojsonText = ref(
   JSON.stringify(
     {
@@ -70,6 +132,11 @@ const feedback = ref('请先选择绘制模式（点/面），然后在地图上
 const isExportModalOpen = ref(false)
 const showGeojsonText = ref(false)
 const isEditingSelected = ref(false)
+const isBuildingLayerVisible = ref(false)
+const isBuildingDataLoading = ref(false)
+const hasBuildingDataLoaded = ref(false)
+const visibleBuildingCandidateCount = ref(0)
+const currentMapZoom = ref(11)
 
 let map: any | null = null
 let mouseTool: any | null = null
@@ -79,13 +146,18 @@ let suggestionRequestSeq = 0
 let mapApi: any | null = null
 
 const overlays = new Map<string, StoredOverlay>()
-let features: Feature[] = []
+const buildingCandidatesById = new Map<string, CandidateBuilding>()
+const buildingCandidateOverlays = new Map<string, any>()
+
+let features: ExportFeature[] = []
+let buildingCandidates: CandidateBuilding[] = []
+let exportedBuildingSourceIds = new Set<string>()
 
 const parsedFeatureCollection = computed(() => {
   try {
-    return JSON.parse(geojsonText.value) as FeatureCollection
+    return JSON.parse(geojsonText.value) as ExportFeatureCollection
   } catch {
-    return { type: 'FeatureCollection', features: [] } as FeatureCollection
+    return { type: 'FeatureCollection', features: [] } as ExportFeatureCollection
   }
 })
 
@@ -98,10 +170,36 @@ const pointCount = computed(
 )
 const polygonCount = computed(
   () =>
-    parsedFeatureCollection.value.features.filter(
-      (feature) => feature.geometry?.type === 'Polygon',
-    ).length,
+    parsedFeatureCollection.value.features.filter((feature) => {
+      const geometryType = feature.geometry?.type
+      return geometryType === 'Polygon' || geometryType === 'MultiPolygon'
+    }).length,
 )
+const selectedBuildingCandidateCount = computed(() => selectedBuildingCandidateIds.value.length)
+const selectedBuildingCandidateLookup = computed(
+  () => new Set(selectedBuildingCandidateIds.value),
+)
+const isBuildingLayerReady = computed(
+  () => isBuildingLayerVisible.value && hasBuildingDataLoaded.value && !isBuildingDataLoading.value,
+)
+const canUseBuildingLayerAtCurrentZoom = computed(
+  () => currentMapZoom.value >= BUILDING_LAYER_MIN_ZOOM,
+)
+const buildingLayerStatus = computed(() => {
+  if (isBuildingDataLoading.value) {
+    return '建筑面加载中...'
+  }
+  if (!hasBuildingDataLoaded.value) {
+    return '建筑面未加载'
+  }
+  if (!isBuildingLayerVisible.value) {
+    return `建筑面已隐藏，共 ${buildingCandidates.length} 条`
+  }
+  if (!canUseBuildingLayerAtCurrentZoom.value) {
+    return `请放大到 ${BUILDING_LAYER_MIN_ZOOM} 级后查看候选建筑`
+  }
+  return `当前显示 ${visibleBuildingCandidateCount.value} 条，已选 ${selectedBuildingCandidateCount.value} 条`
+})
 
 const createFeatureId = (): string => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -117,28 +215,93 @@ const toLngLatPair = (lngLat: any): [number, number] => {
   return [lngLat?.lng ?? 0, lngLat?.lat ?? 0]
 }
 
+const getFeatureSource = (feature: ExportFeature): OverlaySource =>
+  feature.properties?.sourceType === 'building-import' ? 'building-import' : 'manual'
+
+const syncExportedBuildingSourceIds = (): void => {
+  const nextIds = new Set<string>()
+  for (const feature of features) {
+    const buildingSourceId = feature.properties?.buildingSourceId
+    if (
+      feature.properties?.sourceType === 'building-import' &&
+      typeof buildingSourceId === 'string' &&
+      buildingSourceId
+    ) {
+      nextIds.add(buildingSourceId)
+    }
+  }
+  exportedBuildingSourceIds = nextIds
+}
+
 const syncGeojson = (): void => {
+  const nextFeatures = features.map((feature) =>
+    transformFeatureCoordinates(feature, 'gcj02', exportCoordinateSystem.value),
+  )
+
   geojsonText.value = JSON.stringify(
     {
       type: 'FeatureCollection',
-      features,
+      features: nextFeatures,
     },
     null,
     2,
   )
 }
 
-const updateFeature = (id: string, nextFeature: Feature): void => {
-  features = features.map((feature) => (feature.id === id ? nextFeature : feature))
+watch(exportCoordinateSystem, () => {
   syncGeojson()
+})
+
+const getSurfaceGeometryFromRings = (
+  geometryType: SurfaceGeometryType,
+  rings: PolygonRings,
+): SurfaceGeometry =>
+  geometryType === 'MultiPolygon'
+    ? {
+        type: 'MultiPolygon',
+        coordinates: [rings],
+      }
+    : {
+        type: 'Polygon',
+        coordinates: rings,
+      }
+
+const getNormalizedSurfaceGeometry = (
+  geometry: SurfaceGeometry,
+): SurfaceGeometry | null => {
+  const rings = geometryToSinglePolygonRings(geometry)
+  if (!rings) return null
+  return getSurfaceGeometryFromRings(geometry.type, rings)
+}
+
+const setSelectedBuildingCandidateIds = (ids: string[]): void => {
+  selectedBuildingCandidateIds.value = ids
+  for (const candidateId of buildingCandidateOverlays.keys()) {
+    applyBuildingCandidateStyle(candidateId)
+  }
+}
+
+const clearBuildingCandidateSelection = (): void => {
+  if (!selectedBuildingCandidateCount.value) return
+  setSelectedBuildingCandidateIds([])
+  feedback.value = '已清空候选建筑选择。'
 }
 
 const applySelectionStyle = (overlayItem: StoredOverlay, selected: boolean): void => {
-  if (overlayItem.type === 'Point') {
-    overlayItem.overlay.setzIndex(selected ? 300 : 120)
+  if (overlayItem.kind === 'export-point') {
+    overlayItem.overlay.setzIndex(selected ? 320 : 150)
     return
   }
-  overlayItem.overlay.setOptions(selected ? POLYGON_SELECTED_STYLE : POLYGON_DEFAULT_STYLE)
+
+  overlayItem.overlay.setOptions(selected ? SELECTED_SURFACE_STYLE : EXPORT_SURFACE_STYLE)
+}
+
+const applyBuildingCandidateStyle = (candidateId: string): void => {
+  const overlay = buildingCandidateOverlays.get(candidateId)
+  if (!overlay) return
+
+  const isSelected = selectedBuildingCandidateLookup.value.has(candidateId)
+  overlay.setOptions(isSelected ? CANDIDATE_SELECTED_STYLE : CANDIDATE_SURFACE_STYLE)
 }
 
 const setSelectedFeature = (nextId: string | null): void => {
@@ -151,31 +314,36 @@ const setSelectedFeature = (nextId: string | null): void => {
   }
 }
 
-const bindOverlayCommonEvents = (overlayItem: StoredOverlay): void => {
+const bindExportOverlayEvents = (overlayItem: StoredOverlay): void => {
   overlayItem.overlay.on('click', () => {
     setSelectedFeature(overlayItem.id)
-    feedback.value = '已选中要素，可点击“删除选中”。'
+    feedback.value = '已选中导出要素，可点击“编辑选中面”或“删除选中”。'
   })
 }
 
-const addPointFeature = (marker: any): void => {
-  const id = createFeatureId()
-  const [lng, lat] = toLngLatPair(marker.getPosition())
-  const feature: Feature<Point> = {
-    type: 'Feature',
-    id,
-    properties: {},
-    geometry: {
-      type: 'Point',
-      coordinates: [lng, lat],
-    },
-  }
+const toggleBuildingCandidateSelection = (candidateId: string): void => {
+  stopPolygonEditing()
+  setSelectedFeature(null)
 
+  const nextIds = new Set(selectedBuildingCandidateIds.value)
+  if (nextIds.has(candidateId)) {
+    nextIds.delete(candidateId)
+  } else {
+    nextIds.add(candidateId)
+  }
+  setSelectedBuildingCandidateIds([...nextIds])
+  feedback.value = `候选建筑已选 ${nextIds.size} 条，可点击“添加选中建筑”。`
+}
+
+const createExportPointMarker = (feature: Feature<Point>): StoredOverlay => {
+  const marker = new mapApi.Marker({
+    position: [...feature.geometry.coordinates],
+    draggable: true,
+  })
   marker.setMap(map)
-  marker.setDraggable(true)
   marker.on('dragend', () => {
     const [nextLng, nextLat] = toLngLatPair(marker.getPosition())
-    updateFeature(id, {
+    updateFeature(String(feature.id), {
       ...feature,
       geometry: {
         type: 'Point',
@@ -185,42 +353,123 @@ const addPointFeature = (marker: any): void => {
     feedback.value = '点位拖拽已同步到 GeoJSON。'
   })
 
-  const overlayItem: StoredOverlay = { id, type: 'Point', overlay: marker }
-  overlays.set(id, overlayItem)
-  bindOverlayCommonEvents(overlayItem)
+  return {
+    id: String(feature.id),
+    kind: 'export-point',
+    source: getFeatureSource(feature as ExportFeature),
+    geometryType: 'Point',
+    overlay: marker,
+  }
+}
+
+const createExportSurfaceOverlay = (feature: Feature<SurfaceGeometry>): StoredOverlay | null => {
+  const path = geometryToAmapPath(feature.geometry)
+  if (!path) return null
+
+  const polygon = new mapApi.Polygon({
+    path,
+    ...EXPORT_SURFACE_STYLE,
+  })
+  polygon.setMap(map)
+
+  return {
+    id: String(feature.id),
+    kind: 'export-surface',
+    source: getFeatureSource(feature as ExportFeature),
+    geometryType: feature.geometry.type,
+    overlay: polygon,
+  }
+}
+
+const registerExportFeature = (feature: ExportFeature): void => {
+  let overlayItem: StoredOverlay | null = null
+
+  if (feature.geometry.type === 'Point') {
+    overlayItem = createExportPointMarker(feature as Feature<Point, GeoJsonProperties>)
+  } else if (feature.geometry.type === 'Polygon' || feature.geometry.type === 'MultiPolygon') {
+    overlayItem = createExportSurfaceOverlay(feature as Feature<SurfaceGeometry>)
+  }
+
+  if (!overlayItem) return
+  overlays.set(String(feature.id), overlayItem)
+  bindExportOverlayEvents(overlayItem)
+}
+
+const updateFeature = (id: string, nextFeature: ExportFeature): void => {
+  features = features.map((feature) => (String(feature.id) === id ? nextFeature : feature))
+  syncGeojson()
+}
+
+const addPointFeature = (marker: any): void => {
+  const id = createFeatureId()
+  const [lng, lat] = toLngLatPair(marker.getPosition())
+  const feature: Feature<Point> = {
+    type: 'Feature',
+    id,
+    properties: {
+      sourceType: 'manual',
+    },
+    geometry: {
+      type: 'Point',
+      coordinates: [lng, lat],
+    },
+  }
+
+  if (map) {
+    map.remove(marker)
+  }
+
+  registerExportFeature(feature)
   features = [...features, feature]
   syncGeojson()
   setSelectedFeature(id)
 }
 
-const closeRing = (coords: Array<[number, number]>): Array<[number, number]> => {
-  if (coords.length < 3) return coords
-  const first = coords[0]
-  const last = coords[coords.length - 1]
-  if (first[0] === last[0] && first[1] === last[1]) {
-    return coords
+const normalizePolygonPathInput = (path: any): any[][] => {
+  if (!Array.isArray(path) || path.length === 0) {
+    return []
   }
-  return [...coords, first]
+
+  const first = path[0]
+  if (Array.isArray(first)) {
+    return path as any[][]
+  }
+
+  return [path as any[]]
+}
+
+const getPolygonRingsFromOverlay = (polygon: any): PolygonRings => {
+  const paths = normalizePolygonPathInput(polygon.getPath())
+  return paths
+    .map((path) => closeRing(path.map((lngLat) => toLngLatPair(lngLat))))
+    .filter((ring) => ring.length >= 4)
 }
 
 const addPolygonFeature = (polygon: any): void => {
   const id = createFeatureId()
-  const path = (polygon.getPath() as any[]).map((lngLat) => toLngLatPair(lngLat))
-  const ring = closeRing(path)
+  const rings = getPolygonRingsFromOverlay(polygon)
+  if (!rings.length) {
+    feedback.value = '当前面要素无有效坐标，未能写入导出集合。'
+    return
+  }
+
   const feature: Feature<Polygon> = {
     type: 'Feature',
     id,
-    properties: {},
+    properties: {
+      sourceType: 'manual',
+    },
     geometry: {
       type: 'Polygon',
-      coordinates: [ring],
+      coordinates: rings,
     },
   }
 
-  polygon.setMap(map)
-  const overlayItem: StoredOverlay = { id, type: 'Polygon', overlay: polygon }
-  overlays.set(id, overlayItem)
-  bindOverlayCommonEvents(overlayItem)
+  if (map) {
+    map.remove(polygon)
+  }
+
+  registerExportFeature(feature)
   features = [...features, feature]
   syncGeojson()
   setSelectedFeature(id)
@@ -229,29 +478,30 @@ const addPolygonFeature = (polygon: any): void => {
 const removeFeatureById = (id: string): void => {
   const target = overlays.get(id)
   if (!target || !map) return
+
   if (selectedFeatureId.value === id) {
     polygonEditor?.close()
     polygonEditor = null
     isEditingSelected.value = false
   }
+
   map.remove(target.overlay)
   overlays.delete(id)
-  features = features.filter((feature) => feature.id !== id)
+  features = features.filter((feature) => String(feature.id) !== id)
+
   if (selectedFeatureId.value === id) {
     setSelectedFeature(null)
   }
+
+  syncExportedBuildingSourceIds()
   syncGeojson()
+  refreshVisibleBuildingCandidates()
 }
 
 const stopDrawing = (): void => {
   mouseTool?.close()
   map?.setDefaultCursor('default')
   drawMode.value = 'none'
-}
-
-const getPolygonRingFromOverlay = (polygon: any): Array<[number, number]> => {
-  const path = (polygon.getPath() as any[]).map((lngLat) => toLngLatPair(lngLat))
-  return closeRing(path)
 }
 
 const stopPolygonEditing = (): void => {
@@ -266,8 +516,9 @@ const startEditSelected = (): void => {
     feedback.value = '请先选中一个面要素。'
     return
   }
+
   const selected = overlays.get(selectedFeatureId.value)
-  if (!selected || selected.type !== 'Polygon') {
+  if (!selected || selected.kind !== 'export-surface') {
     feedback.value = '当前选中要素不是面，无法编辑。'
     return
   }
@@ -277,17 +528,22 @@ const startEditSelected = (): void => {
 
   polygonEditor = new mapApi.PolygonEditor(map, selected.overlay)
   const syncPolygon = () => {
-    const ring = getPolygonRingFromOverlay(selected.overlay)
+    const currentFeature = features.find((feature) => String(feature.id) === selected.id)
+    if (!currentFeature || currentFeature.geometry.type === 'Point') {
+      return
+    }
+
+    const rings = getPolygonRingsFromOverlay(selected.overlay)
+    if (!rings.length) {
+      return
+    }
+
     updateFeature(selected.id, {
-      type: 'Feature',
-      id: selected.id,
-      properties: {},
-      geometry: {
-        type: 'Polygon',
-        coordinates: [ring],
-      },
+      ...currentFeature,
+      geometry: getSurfaceGeometryFromRings(selected.geometryType as SurfaceGeometryType, rings),
     })
   }
+
   polygonEditor.on('adjust', syncPolygon)
   polygonEditor.on('addnode', syncPolygon)
   polygonEditor.on('removenode', syncPolygon)
@@ -316,14 +572,288 @@ const startDrawPolygon = (): void => {
   mouseTool.close()
   map?.setDefaultCursor('crosshair')
   mouseTool.polygon({
-    ...POLYGON_DEFAULT_STYLE,
+    ...EXPORT_SURFACE_STYLE,
   })
   feedback.value = '面绘制模式已开启：点击地图依次落点，双击结束。'
 }
 
+const getMapBoundsBBox = (): BBox | null => {
+  if (!map) return null
+  const bounds = map.getBounds?.()
+  if (!bounds) return null
+  const [minLng, minLat] = toLngLatPair(bounds.getSouthWest())
+  const [maxLng, maxLat] = toLngLatPair(bounds.getNorthEast())
+  return [minLng, minLat, maxLng, maxLat]
+}
+
+const clearBuildingCandidateOverlays = (): void => {
+  if (map && buildingCandidateOverlays.size) {
+    map.remove([...buildingCandidateOverlays.values()])
+  }
+  buildingCandidateOverlays.clear()
+  visibleBuildingCandidateCount.value = 0
+}
+
+const refreshVisibleBuildingCandidates = (): void => {
+  if (!map || !mapApi) return
+
+  if (
+    !isBuildingLayerVisible.value ||
+    !hasBuildingDataLoaded.value ||
+    !canUseBuildingLayerAtCurrentZoom.value
+  ) {
+    clearBuildingCandidateOverlays()
+    return
+  }
+
+  const bounds = getMapBoundsBBox()
+  if (!bounds) {
+    clearBuildingCandidateOverlays()
+    return
+  }
+
+  const expandedBounds = expandBounds(bounds, BUILDING_LAYER_BOUNDS_PADDING)
+  const nextVisibleIds: string[] = []
+
+  for (const candidate of buildingCandidates) {
+    if (exportedBuildingSourceIds.has(candidate.id)) continue
+    if (!bboxIntersects(candidate.bbox, expandedBounds)) continue
+    nextVisibleIds.push(candidate.id)
+    if (nextVisibleIds.length >= BUILDING_LAYER_RENDER_LIMIT) {
+      break
+    }
+  }
+
+  const nextVisibleSet = new Set(nextVisibleIds)
+
+  for (const [candidateId, overlay] of buildingCandidateOverlays.entries()) {
+    if (nextVisibleSet.has(candidateId)) continue
+    map.remove(overlay)
+    buildingCandidateOverlays.delete(candidateId)
+  }
+
+  for (const candidateId of nextVisibleIds) {
+    if (buildingCandidateOverlays.has(candidateId)) {
+      applyBuildingCandidateStyle(candidateId)
+      continue
+    }
+
+    const candidate = buildingCandidatesById.get(candidateId)
+    if (!candidate) continue
+    const path = geometryToAmapPath(candidate.geometry)
+    if (!path) continue
+
+    const polygon = new mapApi.Polygon({
+      path,
+      ...CANDIDATE_SURFACE_STYLE,
+    })
+    polygon.setMap(map)
+    polygon.on('click', () => {
+      toggleBuildingCandidateSelection(candidateId)
+    })
+    buildingCandidateOverlays.set(candidateId, polygon)
+    applyBuildingCandidateStyle(candidateId)
+  }
+
+  visibleBuildingCandidateCount.value = nextVisibleIds.length
+}
+
+const ensureBuildingCandidatesLoaded = async (): Promise<void> => {
+  if (hasBuildingDataLoaded.value || isBuildingDataLoading.value) return
+
+  isBuildingDataLoading.value = true
+  feedback.value = '正在载入建筑面底图，请稍候...'
+
+  try {
+    const resp = await fetch(buildingGeojsonUrl)
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`)
+    }
+
+    const data = (await resp.json()) as FeatureCollection<SurfaceGeometry, GeoJsonProperties>
+    const nextCandidates: CandidateBuilding[] = []
+
+    buildingCandidatesById.clear()
+
+    data.features.forEach((feature, index) => {
+      const rawGeometry = feature.geometry
+      if (!rawGeometry || (rawGeometry.type !== 'Polygon' && rawGeometry.type !== 'MultiPolygon')) {
+        return
+      }
+
+      const convertedFeature = transformFeatureCoordinates(
+        {
+          type: 'Feature',
+          id: String(feature.id ?? `building-${index}`),
+          properties: feature.properties ?? {},
+          geometry: rawGeometry,
+        } as Feature<SurfaceGeometry, GeoJsonProperties>,
+        'wgs84',
+        'gcj02',
+      )
+
+      const normalizedGeometry = getNormalizedSurfaceGeometry(convertedFeature.geometry)
+      if (!normalizedGeometry) {
+        return
+      }
+
+      const bbox = getBoundsFromGeometry(normalizedGeometry)
+      if (!bbox) {
+        return
+      }
+
+      const candidate: CandidateBuilding = {
+        id: String(feature.id ?? `building-${index}`),
+        geometryType: normalizedGeometry.type,
+        geometry: normalizedGeometry,
+        properties: feature.properties ?? {},
+        bbox,
+      }
+
+      nextCandidates.push(candidate)
+      buildingCandidatesById.set(candidate.id, candidate)
+    })
+
+    buildingCandidates = nextCandidates
+    hasBuildingDataLoaded.value = true
+    feedback.value = `建筑面已加载，共 ${buildingCandidates.length} 条。`
+  } catch (error) {
+    console.error(error)
+    feedback.value = '建筑面数据加载失败，请检查 GeoJSON 文件。'
+  } finally {
+    isBuildingDataLoading.value = false
+  }
+}
+
+const toggleBuildingLayer = async (): Promise<void> => {
+  if (isBuildingLayerVisible.value) {
+    isBuildingLayerVisible.value = false
+    if (drawMode.value === 'building-rectangle') {
+      stopDrawing()
+    }
+    clearBuildingCandidateOverlays()
+    feedback.value = '建筑面候选层已隐藏。'
+    return
+  }
+
+  await ensureBuildingCandidatesLoaded()
+  if (!hasBuildingDataLoaded.value) return
+
+  isBuildingLayerVisible.value = true
+  refreshVisibleBuildingCandidates()
+
+  if (!canUseBuildingLayerAtCurrentZoom.value) {
+    feedback.value = `建筑面已加载，请放大到 ${BUILDING_LAYER_MIN_ZOOM} 级后查看。`
+    return
+  }
+
+  feedback.value = '建筑面候选层已显示，可点击或框选建筑后加入导出集合。'
+}
+
+const startRectangleSelectBuildings = (): void => {
+  if (!mouseTool) return
+  if (!isBuildingLayerReady.value) {
+    feedback.value = '请先显示建筑面候选层。'
+    return
+  }
+  if (!canUseBuildingLayerAtCurrentZoom.value) {
+    feedback.value = `请放大到 ${BUILDING_LAYER_MIN_ZOOM} 级后再进行框选。`
+    return
+  }
+
+  stopPolygonEditing()
+  setSelectedFeature(null)
+  drawMode.value = 'building-rectangle'
+  mouseTool.close()
+  map?.setDefaultCursor('crosshair')
+  mouseTool.rectangle({
+    strokeColor: '#7c3aed',
+    strokeWeight: 2,
+    strokeOpacity: 0.9,
+    fillColor: '#a78bfa',
+    fillOpacity: 0.12,
+  })
+  feedback.value = '框选模式已开启：按住鼠标拖拽选中范围内建筑。'
+}
+
+const addSelectedBuildingCandidates = (): void => {
+  if (!selectedBuildingCandidateCount.value) {
+    feedback.value = '请先点击或框选候选建筑。'
+    return
+  }
+
+  const nextFeatures = [...features]
+  let addedCount = 0
+  let lastAddedId: string | null = null
+
+  for (const candidateId of selectedBuildingCandidateIds.value) {
+    if (exportedBuildingSourceIds.has(candidateId)) continue
+    const candidate = buildingCandidatesById.get(candidateId)
+    if (!candidate) continue
+
+    const featureId = createFeatureId()
+    const nextFeature: Feature<SurfaceGeometry> = {
+      type: 'Feature',
+      id: featureId,
+      properties: {
+        ...(candidate.properties ?? {}),
+        sourceType: 'building-import',
+        buildingSourceId: candidate.id,
+      },
+      geometry: candidate.geometry,
+    }
+
+    registerExportFeature(nextFeature)
+    nextFeatures.push(nextFeature)
+    addedCount += 1
+    lastAddedId = featureId
+  }
+
+  if (!addedCount) {
+    feedback.value = '选中的建筑都已经在导出集合中了。'
+    return
+  }
+
+  features = nextFeatures
+  syncExportedBuildingSourceIds()
+  setSelectedBuildingCandidateIds([])
+  syncGeojson()
+  refreshVisibleBuildingCandidates()
+  if (lastAddedId) {
+    setSelectedFeature(lastAddedId)
+  }
+  feedback.value = `已添加 ${addedCount} 条建筑到导出集合。`
+}
+
+const handleRectangleSelection = (rectangle: any): void => {
+  if (!map) return
+
+  const bounds = rectangle?.getBounds?.()
+  map.remove(rectangle)
+
+  if (!bounds) {
+    feedback.value = '框选失败，请重试。'
+    return
+  }
+
+  const [minLng, minLat] = toLngLatPair(bounds.getSouthWest())
+  const [maxLng, maxLat] = toLngLatPair(bounds.getNorthEast())
+  const rectangleBounds: BBox = [minLng, minLat, maxLng, maxLat]
+  const nextIds = new Set(selectedBuildingCandidateIds.value)
+
+  for (const candidate of buildingCandidates) {
+    if (exportedBuildingSourceIds.has(candidate.id)) continue
+    if (!bboxIntersects(candidate.bbox, rectangleBounds)) continue
+    nextIds.add(candidate.id)
+  }
+
+  setSelectedBuildingCandidateIds([...nextIds])
+  feedback.value = `框选完成，候选建筑已选 ${nextIds.size} 条。`
+}
+
 const deleteSelected = (): void => {
   if (!selectedFeatureId.value) {
-    feedback.value = '请先在地图上点选一个要素。'
+    feedback.value = '请先在地图上点选一个导出要素。'
     return
   }
   removeFeatureById(selectedFeatureId.value)
@@ -332,7 +862,7 @@ const deleteSelected = (): void => {
 
 const copyGeojson = async (): Promise<void> => {
   if (!featureCount.value) {
-    feedback.value = '当前没有可复制的要素，请先绘制。'
+    feedback.value = '当前没有可复制的要素，请先绘制或添加建筑。'
     return
   }
 
@@ -346,7 +876,7 @@ const copyGeojson = async (): Promise<void> => {
 
 const downloadGeojson = (): void => {
   if (!featureCount.value) {
-    feedback.value = '当前没有可下载的要素，请先绘制。'
+    feedback.value = '当前没有可下载的要素，请先绘制或添加建筑。'
     return
   }
 
@@ -354,7 +884,7 @@ const downloadGeojson = (): void => {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `features-${Date.now()}.geojson`
+  anchor.download = `features-${exportCoordinateSystem.value}-${Date.now()}.geojson`
   anchor.click()
   URL.revokeObjectURL(url)
   feedback.value = 'GeoJSON 文件已开始下载。'
@@ -364,15 +894,18 @@ const clearAll = (): void => {
   if (!map) return
   stopDrawing()
   stopPolygonEditing()
+
   const all = [...overlays.values()].map((item) => item.overlay)
   if (all.length) {
     map.remove(all)
   }
   overlays.clear()
   features = []
+  syncExportedBuildingSourceIds()
   setSelectedFeature(null)
   syncGeojson()
-  feedback.value = '已清空全部要素。'
+  refreshVisibleBuildingCandidates()
+  feedback.value = '已清空全部导出要素。'
 }
 
 const closeExportModal = (): void => {
@@ -383,96 +916,98 @@ const toggleGeojsonText = (): void => {
   showGeojsonText.value = !showGeojsonText.value
 }
 
-const loadFeaturesToMap = (nextFeatures: Feature[]): void => {
-  if (!map || !mapApi) return
-  stopDrawing()
-  stopPolygonEditing()
+const normalizeIncomingFeature = (
+  rawFeature: Feature,
+  inputCoordinateSystem: ExportCoordinateSystem,
+): ExportFeature | null => {
+  const id = String(rawFeature.id ?? createFeatureId())
+  const properties = rawFeature.properties ?? {}
+  const geometry = rawFeature.geometry
 
-  const all = [...overlays.values()].map((item) => item.overlay)
-  if (all.length) {
-    map.remove(all)
+  if (!geometry) return null
+
+  if (geometry.type === 'Point') {
+    const converted = transformFeatureCoordinates(
+      {
+        type: 'Feature',
+        id,
+        properties,
+        geometry,
+      } as Feature<Point, GeoJsonProperties>,
+      inputCoordinateSystem,
+      'gcj02',
+    )
+
+    return converted
+  }
+
+  if (geometry.type !== 'Polygon' && geometry.type !== 'MultiPolygon') {
+    return null
+  }
+
+  const converted = transformFeatureCoordinates(
+    {
+      type: 'Feature',
+      id,
+      properties,
+      geometry,
+    } as Feature<SurfaceGeometry, GeoJsonProperties>,
+    inputCoordinateSystem,
+    'gcj02',
+  )
+
+  const normalizedGeometry = getNormalizedSurfaceGeometry(converted.geometry)
+  if (!normalizedGeometry) {
+    return null
+  }
+
+  return {
+    ...converted,
+    geometry: normalizedGeometry,
+  }
+}
+
+const clearExportOverlays = (): void => {
+  if (map && overlays.size) {
+    map.remove([...overlays.values()].map((item) => item.overlay))
   }
   overlays.clear()
+}
 
-  const accepted: Feature[] = []
+const loadFeaturesToMap = (
+  nextFeatures: Feature[],
+  inputCoordinateSystem: ExportCoordinateSystem = exportCoordinateSystem.value,
+): void => {
+  if (!map || !mapApi) return
+
+  stopDrawing()
+  stopPolygonEditing()
+  clearExportOverlays()
+
+  const accepted: ExportFeature[] = []
 
   for (const rawFeature of nextFeatures) {
-    const id = String(rawFeature.id ?? createFeatureId())
-    const geometryType = rawFeature.geometry?.type
-
-    if (geometryType === 'Point') {
-      const coords = (rawFeature.geometry as Point).coordinates
-      if (!coords || coords.length < 2) continue
-      const marker = new mapApi.Marker({
-        position: [coords[0], coords[1]],
-        draggable: true,
-      })
-      marker.setMap(map)
-      const fixedFeature: Feature<Point> = {
-        type: 'Feature',
-        id,
-        properties: rawFeature.properties ?? {},
-        geometry: {
-          type: 'Point',
-          coordinates: [coords[0], coords[1]],
-        },
-      }
-      marker.on('dragend', () => {
-        const [nextLng, nextLat] = toLngLatPair(marker.getPosition())
-        updateFeature(id, {
-          ...fixedFeature,
-          geometry: {
-            type: 'Point',
-            coordinates: [nextLng, nextLat],
-          },
-        })
-      })
-      const overlayItem: StoredOverlay = { id, type: 'Point', overlay: marker }
-      overlays.set(id, overlayItem)
-      bindOverlayCommonEvents(overlayItem)
-      accepted.push(fixedFeature)
-      continue
-    }
-
-    if (geometryType === 'Polygon') {
-      const polygonCoords = (rawFeature.geometry as Polygon).coordinates
-      const firstRing = polygonCoords?.[0]
-      if (!firstRing || firstRing.length < 3) continue
-      const ring = closeRing(firstRing.map((pair) => [pair[0], pair[1]] as [number, number]))
-      const polygon = new mapApi.Polygon({
-        path: ring,
-        ...POLYGON_DEFAULT_STYLE,
-      })
-      polygon.setMap(map)
-      const fixedFeature: Feature<Polygon> = {
-        type: 'Feature',
-        id,
-        properties: rawFeature.properties ?? {},
-        geometry: {
-          type: 'Polygon',
-          coordinates: [ring],
-        },
-      }
-      const overlayItem: StoredOverlay = { id, type: 'Polygon', overlay: polygon }
-      overlays.set(id, overlayItem)
-      bindOverlayCommonEvents(overlayItem)
-      accepted.push(fixedFeature)
-    }
+    const normalized = normalizeIncomingFeature(rawFeature, inputCoordinateSystem)
+    if (!normalized) continue
+    registerExportFeature(normalized)
+    accepted.push(normalized)
   }
 
   features = accepted
-  setSelectedFeature(accepted[0]?.id ? String(accepted[0].id) : null)
+  syncExportedBuildingSourceIds()
   syncGeojson()
+  refreshVisibleBuildingCandidates()
+  setSelectedFeature(accepted[0]?.id ? String(accepted[0].id) : null)
 }
 
 const applyGeojsonText = (): void => {
   try {
-    const parsed = JSON.parse(geojsonText.value) as FeatureCollection
+    const parsed = JSON.parse(geojsonText.value) as ExportFeatureCollection
     if (parsed.type !== 'FeatureCollection' || !Array.isArray(parsed.features)) {
       feedback.value = 'GeoJSON 格式错误：必须是 FeatureCollection。'
       return
     }
-    loadFeaturesToMap(parsed.features as Feature[])
+    loadFeaturesToMap(parsed.features as Feature[], exportCoordinateSystem.value)
     feedback.value = 'GeoJSON 已应用到地图。'
   } catch {
     feedback.value = 'GeoJSON 文本解析失败，请检查 JSON 格式。'
@@ -690,19 +1225,33 @@ onMounted(async () => {
       mapStyle: amapMapStyle,
     })
 
+    currentMapZoom.value = map.getZoom()
     map.addControl(new mapApi.Scale())
     map.addControl(new mapApi.ToolBar())
 
     mouseTool = new mapApi.MouseTool(map)
     mouseTool.on('draw', (event: { obj?: any }) => {
       if (!event.obj) return
+
       if (drawMode.value === 'point') {
         addPointFeature(event.obj)
+        feedback.value = '点位已加入导出集合。'
       } else if (drawMode.value === 'polygon') {
         addPolygonFeature(event.obj)
+        feedback.value = '面要素已加入导出集合。'
+      } else if (drawMode.value === 'building-rectangle') {
+        handleRectangleSelection(event.obj)
       }
+
       stopDrawing()
-      feedback.value = '绘制成功，可通过右上角导出按钮导出 GeoJSON。'
+    })
+
+    map.on('moveend', () => {
+      refreshVisibleBuildingCandidates()
+    })
+    map.on('zoomend', () => {
+      currentMapZoom.value = map?.getZoom?.() ?? currentMapZoom.value
+      refreshVisibleBuildingCandidates()
     })
   } catch (error) {
     console.error(error)
@@ -718,8 +1267,12 @@ onUnmounted(() => {
 
   stopDrawing()
   stopPolygonEditing()
-  overlays.clear()
+  clearExportOverlays()
+  clearBuildingCandidateOverlays()
   features = []
+  buildingCandidates = []
+  buildingCandidatesById.clear()
+  selectedBuildingCandidateIds.value = []
   setSelectedFeature(null)
 
   map?.destroy()
@@ -735,7 +1288,7 @@ onUnmounted(() => {
 
     <header class="top-bar">
       <div class="brand">
-        <h1>GeoJSON 手动绘制工具</h1>
+        <h1>GeoJSON 建筑面提取工具</h1>
         <p>底图：高德 JSAPI 2.0（Loader 初始化）</p>
       </div>
 
@@ -801,6 +1354,44 @@ onUnmounted(() => {
         结束编辑
       </button>
       <button type="button" class="btn btn-ghost" @click="deleteSelected">删除选中</button>
+
+      <button
+        type="button"
+        class="btn"
+        :class="isBuildingLayerVisible ? 'btn-primary' : 'btn-ghost'"
+        :disabled="isBuildingDataLoading"
+        @click="toggleBuildingLayer"
+      >
+        {{ isBuildingDataLoading ? '加载建筑面…' : isBuildingLayerVisible ? '隐藏建筑面' : '显示建筑面' }}
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost"
+        :disabled="!isBuildingLayerReady || !canUseBuildingLayerAtCurrentZoom"
+        @click="startRectangleSelectBuildings"
+      >
+        框选建筑
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost"
+        :disabled="!selectedBuildingCandidateCount"
+        @click="addSelectedBuildingCandidates"
+      >
+        添加选中建筑
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost"
+        :disabled="!selectedBuildingCandidateCount"
+        @click="clearBuildingCandidateSelection"
+      >
+        清空候选选择
+      </button>
+
+      <p class="candidate-status">
+        {{ buildingLayerStatus }}
+      </p>
     </div>
 
     <p class="feedback-toast">
@@ -827,6 +1418,18 @@ onUnmounted(() => {
             <span>面：{{ polygonCount }}</span>
           </div>
 
+          <section class="coord-switch">
+            <span class="section-label">导出坐标系</span>
+            <label class="coord-option">
+              <input v-model="exportCoordinateSystem" type="radio" value="gcj02" />
+              <span>GCJ-02（高德）</span>
+            </label>
+            <label class="coord-option">
+              <input v-model="exportCoordinateSystem" type="radio" value="wgs84" />
+              <span>WGS84（84 坐标）</span>
+            </label>
+          </section>
+
           <div class="actions">
             <button type="button" class="btn btn-primary" @click="copyGeojson">复制 GeoJSON</button>
             <button type="button" class="btn btn-primary" @click="downloadGeojson">下载 .geojson</button>
@@ -838,11 +1441,13 @@ onUnmounted(() => {
           </button>
 
           <div v-if="showGeojsonText" class="geojson-wrapper">
-            <label for="geojson-output" class="textarea-label">GeoJSON 输出</label>
+            <label for="geojson-output" class="textarea-label">
+              GeoJSON 输出（{{ exportCoordinateSystem === 'gcj02' ? 'GCJ-02' : 'WGS84' }}）
+            </label>
             <textarea
               id="geojson-output"
-              class="geojson-output"
               v-model="geojsonText"
+              class="geojson-output"
               spellcheck="false"
             />
             <button type="button" class="btn btn-ghost" @click="applyGeojsonText">
