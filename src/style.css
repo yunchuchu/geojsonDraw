@@ -77,15 +77,64 @@ body,
   align-items: center;
   gap: 8px;
   flex: 1;
+  position: relative;
+}
+
+.search-input-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
 }
 
 .search-input {
-  flex: 1;
+  width: 100%;
   min-width: 0;
   padding: 8px 10px;
   border-radius: 999px;
   border: 1px solid var(--border);
   font-size: 14px;
+}
+
+.search-suggestions {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 11;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.15);
+}
+
+.search-suggestion-item {
+  width: 100%;
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.search-suggestion-item:hover {
+  background: var(--panel-muted);
+}
+
+.tip-name {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.tip-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .search-input:focus-visible {
@@ -99,6 +148,21 @@ body,
 
 .export-trigger {
   white-space: nowrap;
+}
+
+.draw-actions-panel {
+  position: absolute;
+  right: 16px;
+  top: 92px;
+  z-index: 10;
+  display: grid;
+  gap: 8px;
+  width: min(200px, 44vw);
+}
+
+.draw-actions-panel .btn {
+  min-height: 40px;
+  font-size: 13px;
 }
 
 .stats {
@@ -166,6 +230,11 @@ body,
 
 .btn-ghost:hover {
   background: var(--panel-muted);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .feedback {
@@ -294,5 +363,14 @@ body,
 
   .export-trigger {
     align-self: flex-end;
+  }
+
+  .draw-actions-panel {
+    top: auto;
+    bottom: 16px;
+    right: 16px;
+    left: 16px;
+    width: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
