@@ -28,7 +28,7 @@ import {
 } from './utils/geometry'
 import { regularizePolygonRing } from './utils/regularize'
 
-type DrawMode = 'none' | 'polygon' | 'building-rectangle'
+type DrawMode = 'none' | 'polygon' | 'building-rectangle' | 'export-rectangle'
 type ExportCoordinateSystem = CoordinateSystem
 type SurfaceGeometry = Polygon | MultiPolygon
 type ExportGeometry = Point | SurfaceGeometry
@@ -128,6 +128,7 @@ const searchTips = ref<SearchTip[]>([])
 const searchSuggestionsStyle = ref<Record<string, string>>({})
 const drawMode = ref<DrawMode>('none')
 const selectedFeatureId = ref<string | null>(null)
+const selectedExportSurfaceIds = ref<string[]>([])
 const selectedBuildingCandidateIds = ref<string[]>([])
 const exportCoordinateSystem = ref<ExportCoordinateSystem>('gcj02')
 const geojsonText = ref(
@@ -150,6 +151,7 @@ const isBuildingDataLoading = ref(false)
 const hasBuildingDataLoaded = ref(false)
 const visibleBuildingCandidateCount = ref(0)
 const currentMapZoom = ref(11)
+const isBuildingActionsExpanded = ref(false)
 
 let map: any | null = null
 let mouseTool: any | null = null
@@ -159,9 +161,12 @@ let suggestionRequestSeq = 0
 let mapApi: any | null = null
 let surfaceDragHandleMarker: any | null = null
 let surfaceDragStartPosition: [number, number] | null = null
-let surfaceDragStartRings: PolygonRings | null = null
+let surfaceDragStartItems:
+  | Array<{ id: string; geometryType: SurfaceGeometryType; rings: PolygonRings }>
+  | null = null
 let surfaceDragPointerCleanup: (() => void) | null = null
 let surfaceWorkbenchUnmount: (() => void) | null = null
+let surfaceWorkbenchMode: 'single' | 'batch' | null = null
 
 const overlays = new Map<string, StoredOverlay>()
 const buildingCandidatesById = new Map<string, CandidateBuilding>()
@@ -190,6 +195,14 @@ const polygonCount = computed(
 const selectedBuildingCandidateCount = computed(() => selectedBuildingCandidateIds.value.length)
 const selectedBuildingCandidateLookup = computed(
   () => new Set(selectedBuildingCandidateIds.value),
+)
+const selectedExportSurfaceLookup = computed(() => new Set(selectedExportSurfaceIds.value))
+const batchSurfaceCount = computed(() => selectedExportSurfaceIds.value.length)
+const isBatchSurfaceSelection = computed(() => batchSurfaceCount.value > 1)
+const hasExportSurfaceFeatures = computed(() =>
+  parsedFeatureCollection.value.features.some(
+    (feature) => feature.geometry?.type === 'Polygon' || feature.geometry?.type === 'MultiPolygon',
+  ),
 )
 const isBuildingLayerReady = computed(
   () => isBuildingLayerVisible.value && hasBuildingDataLoaded.value && !isBuildingDataLoading.value,
@@ -265,6 +278,12 @@ watch(exportCoordinateSystem, () => {
   syncGeojson()
 })
 
+watch(isBuildingLayerVisible, (visible) => {
+  if (!visible) {
+    isBuildingActionsExpanded.value = false
+  }
+})
+
 const getSurfaceGeometryFromRings = (
   geometryType: SurfaceGeometryType,
   rings: PolygonRings,
@@ -295,10 +314,7 @@ const getSurfaceFeatureById = (id: string): Feature<SurfaceGeometry, GeoJsonProp
   return feature as Feature<SurfaceGeometry, GeoJsonProperties>
 }
 
-const getDragHandlePosition = (geometry: SurfaceGeometry): [number, number] | null => {
-  const bounds = getBoundsFromGeometry(geometry)
-  if (!bounds) return null
-
+const getDragHandlePositionFromBounds = (bounds: BBox): [number, number] | null => {
   const centerLng = (bounds[0] + bounds[2]) / 2
   const topLat = bounds[3]
 
@@ -316,6 +332,65 @@ const getDragHandlePosition = (geometry: SurfaceGeometry): [number, number] | nu
   const lngLat = map.containerToLngLat(new mapApi.Pixel(x, y))
 
   return lngLat ? toLngLatPair(lngLat) : [centerLng, topLat]
+}
+
+const getDragHandlePosition = (geometry: SurfaceGeometry): [number, number] | null => {
+  const bounds = getBoundsFromGeometry(geometry)
+  if (!bounds) return null
+  return getDragHandlePositionFromBounds(bounds)
+}
+
+const getBatchSurfaceBounds = (ids: string[]): BBox | null => {
+  let minLng = Number.POSITIVE_INFINITY
+  let minLat = Number.POSITIVE_INFINITY
+  let maxLng = Number.NEGATIVE_INFINITY
+  let maxLat = Number.NEGATIVE_INFINITY
+
+  for (const id of ids) {
+    const feature = getSurfaceFeatureById(id)
+    if (!feature) continue
+    const bounds = getBoundsFromGeometry(feature.geometry)
+    if (!bounds) continue
+    minLng = Math.min(minLng, bounds[0])
+    minLat = Math.min(minLat, bounds[1])
+    maxLng = Math.max(maxLng, bounds[2])
+    maxLat = Math.max(maxLat, bounds[3])
+  }
+
+  if (!Number.isFinite(minLng) || !Number.isFinite(minLat)) {
+    return null
+  }
+  return [minLng, minLat, maxLng, maxLat]
+}
+
+const getSurfaceWorkbenchSelectionIds = (): string[] => {
+  if (surfaceWorkbenchMode === 'batch' || isBatchSurfaceSelection.value) {
+    return selectedExportSurfaceIds.value.filter((id) => {
+      const overlayItem = overlays.get(id)
+      return overlayItem?.kind === 'export-surface' && Boolean(getSurfaceFeatureById(id))
+    })
+  }
+  if (!selectedFeatureId.value) return []
+  const overlayItem = overlays.get(selectedFeatureId.value)
+  if (overlayItem?.kind !== 'export-surface') return []
+  if (!getSurfaceFeatureById(selectedFeatureId.value)) return []
+  return [selectedFeatureId.value]
+}
+
+const getSurfaceDragSelectionItems = (ids: string[]) => {
+  const items: Array<{ id: string; geometryType: SurfaceGeometryType; rings: PolygonRings }> = []
+  for (const id of ids) {
+    const feature = getSurfaceFeatureById(id)
+    if (!feature) continue
+    const rings = geometryToSinglePolygonRings(feature.geometry)
+    if (!rings) continue
+    items.push({
+      id,
+      geometryType: feature.geometry.type,
+      rings: rings.map((ring) => ring.map(([lng, lat]) => [lng, lat] as [number, number])),
+    })
+  }
+  return items
 }
 
 const getLngLatFromClientPoint = (clientX: number, clientY: number): [number, number] | null => {
@@ -339,27 +414,57 @@ const teardownSurfaceDragHandle = (): void => {
   }
   surfaceDragHandleMarker = null
   surfaceDragStartPosition = null
-  surfaceDragStartRings = null
+  surfaceDragStartItems = null
+  surfaceWorkbenchMode = null
 }
 
 const syncSurfaceDragHandlePosition = (): void => {
-  if (!surfaceDragHandleMarker || !selectedFeatureId.value) return
-
-  const selectedFeature = getSurfaceFeatureById(selectedFeatureId.value)
-  if (!selectedFeature) return
-
-  const position = getDragHandlePosition(selectedFeature.geometry)
+  if (!surfaceDragHandleMarker) return
+  const selectionIds = getSurfaceWorkbenchSelectionIds()
+  if (!selectionIds.length) return
+  let position: [number, number] | null = null
+  if (selectionIds.length > 1) {
+    const batchBounds = getBatchSurfaceBounds(selectionIds)
+    position = batchBounds ? getDragHandlePositionFromBounds(batchBounds) : null
+  } else {
+    const selectedFeature = getSurfaceFeatureById(selectionIds[0])
+    position = selectedFeature ? getDragHandlePosition(selectedFeature.geometry) : null
+  }
   if (!position) return
   surfaceDragHandleMarker.setPosition(position)
 }
 
-const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
+const syncSurfaceWorkbenchForSelection = (): void => {
+  if (isEditingSelected.value) return
+  if (isBatchSurfaceSelection.value) {
+    setupSurfaceDragHandle('batch')
+    return
+  }
+  teardownSurfaceDragHandle()
+}
+
+const setupSurfaceDragHandle = (mode: 'single' | 'batch' = 'single'): void => {
   if (!map || !mapApi) return
 
-  const currentFeature = getSurfaceFeatureById(selected.id)
-  if (!currentFeature) return
+  const selectionIds =
+    mode === 'batch' ? selectedExportSurfaceIds.value : selectedFeatureId.value ? [selectedFeatureId.value] : []
+  const validSelectionIds = selectionIds.filter((id) => {
+    const overlayItem = overlays.get(id)
+    return overlayItem?.kind === 'export-surface' && Boolean(getSurfaceFeatureById(id))
+  })
+  if (!validSelectionIds.length) return
+  if (mode === 'batch' && validSelectionIds.length < 2) return
 
-  const position = getDragHandlePosition(currentFeature.geometry)
+  const position =
+    mode === 'batch'
+      ? (() => {
+          const batchBounds = getBatchSurfaceBounds(validSelectionIds)
+          return batchBounds ? getDragHandlePositionFromBounds(batchBounds) : null
+        })()
+      : (() => {
+          const selectedFeature = getSurfaceFeatureById(validSelectionIds[0])
+          return selectedFeature ? getDragHandlePosition(selectedFeature.geometry) : null
+        })()
   if (!position) return
 
   teardownSurfaceDragHandle()
@@ -378,22 +483,22 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
   handleMarker.setMap(map)
 
   const startDrag = (downEvent: MouseEvent): void => {
-    const feature = getSurfaceFeatureById(selected.id)
-    const rings = feature ? geometryToSinglePolygonRings(feature.geometry) : null
-    if (!rings) return
+    const dragItems = getSurfaceDragSelectionItems(validSelectionIds)
+    if (!dragItems.length) return
 
     surfaceDragStartPosition = toLngLatPair(handleMarker.getPosition())
     const dragStartMousePosition =
       getLngLatFromClientPoint(downEvent.clientX, downEvent.clientY) ?? surfaceDragStartPosition
-    surfaceDragStartRings = rings.map((ring) => ring.map(([lng, lat]) => [lng, lat] as [number, number]))
+    surfaceDragStartItems = dragItems
     polygonEditor?.close()
     polygonEditor = null
+    isEditingSelected.value = false
     map?.setDefaultCursor('grabbing')
     let latestDeltaLng = 0
     let latestDeltaLat = 0
 
     const handleMove = (moveEvent: MouseEvent): void => {
-      if (!surfaceDragStartPosition || !surfaceDragStartRings) return
+      if (!surfaceDragStartPosition || !surfaceDragStartItems) return
 
       const nextMousePosition = getLngLatFromClientPoint(moveEvent.clientX, moveEvent.clientY)
       if (!nextMousePosition) return
@@ -402,15 +507,14 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
       const deltaLat = nextMousePosition[1] - dragStartMousePosition[1]
       latestDeltaLng = deltaLng
       latestDeltaLat = deltaLat
-      const nextRings = translatePolygonRings(surfaceDragStartRings, deltaLng, deltaLat)
-      const nextGeometry = getSurfaceGeometryFromRings(
-        selected.geometryType as SurfaceGeometryType,
-        nextRings,
-      )
-      const nextPath = geometryToAmapPath(nextGeometry)
-      if (!nextPath) return
-
-      selected.overlay.setPath(nextPath)
+      for (const item of surfaceDragStartItems) {
+        const nextRings = translatePolygonRings(item.rings, deltaLng, deltaLat)
+        const nextGeometry = getSurfaceGeometryFromRings(item.geometryType, nextRings)
+        const nextPath = geometryToAmapPath(nextGeometry)
+        const overlayItem = overlays.get(item.id)
+        if (!nextPath || overlayItem?.kind !== 'export-surface') continue
+        overlayItem.overlay.setPath(nextPath)
+      }
       handleMarker.setPosition([
         surfaceDragStartPosition[0] + deltaLng,
         surfaceDragStartPosition[1] + deltaLat,
@@ -418,10 +522,9 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
     }
 
     const handleUp = (upEvent: MouseEvent): void => {
-      const currentFeature = getSurfaceFeatureById(selected.id)
       const nextMousePosition = getLngLatFromClientPoint(upEvent.clientX, upEvent.clientY)
 
-      if (!surfaceDragStartPosition || !surfaceDragStartRings) {
+      if (!surfaceDragStartPosition || !surfaceDragStartItems) {
         surfaceDragPointerCleanup?.()
         surfaceDragPointerCleanup = null
         map?.setDefaultCursor('default')
@@ -437,38 +540,50 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
         nextMousePosition?.[1] !== undefined
           ? nextMousePosition[1] - dragStartMousePosition[1]
           : latestDeltaLat
-      const nextRings = translatePolygonRings(surfaceDragStartRings, deltaLng, deltaLat)
-      const nextGeometry = getSurfaceGeometryFromRings(
-        selected.geometryType as SurfaceGeometryType,
-        nextRings,
-      )
-      const nextPath = geometryToAmapPath(nextGeometry)
+      const nextGeometryById = new Map<string, SurfaceGeometry>()
+      for (const item of surfaceDragStartItems) {
+        const nextRings = translatePolygonRings(item.rings, deltaLng, deltaLat)
+        const nextGeometry = getSurfaceGeometryFromRings(item.geometryType, nextRings)
+        const nextPath = geometryToAmapPath(nextGeometry)
+        const overlayItem = overlays.get(item.id)
+        if (!nextPath || overlayItem?.kind !== 'export-surface') continue
+        overlayItem.overlay.setPath(nextPath)
+        nextGeometryById.set(item.id, nextGeometry)
+      }
 
       surfaceDragStartPosition = null
-      surfaceDragStartRings = null
+      surfaceDragStartItems = null
       surfaceDragPointerCleanup?.()
       surfaceDragPointerCleanup = null
       map?.setDefaultCursor('default')
 
-      if (!currentFeature || !nextPath) {
+      if (!nextGeometryById.size) {
         syncSurfaceDragHandlePosition()
         return
       }
 
-      selected.overlay.setPath(nextPath)
-      updateFeature(selected.id, {
-        ...currentFeature,
-        geometry: nextGeometry,
+      features = features.map((feature) => {
+        if (feature.geometry.type === 'Point') return feature
+        const nextGeometry = nextGeometryById.get(String(feature.id))
+        if (!nextGeometry) return feature
+        return {
+          ...feature,
+          geometry: nextGeometry,
+        }
       })
+      syncGeojson()
+      refreshVisibleBuildingCandidates()
 
-      if (isEditingSelected.value) {
-        startEditSelected()
+      if (mode === 'single') {
+        if (selectedFeatureId.value) {
+          startEditSelected()
+        }
         feedback.value = '已通过上方工作区移动选中面。'
         return
       }
 
       syncSurfaceDragHandlePosition()
-      feedback.value = '已通过上方工作区移动选中面。'
+      feedback.value = `已整体移动 ${nextGeometryById.size} 个选中建筑面。`
     }
 
     window.addEventListener('mousemove', handleMove)
@@ -481,18 +596,27 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
 
   const workbenchApp = createApp(SurfaceWorkbench, {
     initialRegularizeThreshold: regularizeThreshold.value,
+    mode,
+    selectionCount: validSelectionIds.length,
     onDragStart: startDrag,
     onCopy: () => {
-      copySelectedFeature()
+      copySelected()
     },
     onFlatten: (threshold: number) => {
       regularizeThreshold.value = threshold
-      flattenSelectedSurface(threshold)
+      flattenSelectedSurfaces(threshold)
     },
     onRemove: () => {
       deleteSelected()
     },
     onFinish: () => {
+      if (mode === 'batch') {
+        setSelectedExportSurfaceIds([])
+        setSelectedFeature(null)
+        teardownSurfaceDragHandle()
+        feedback.value = '已结束当前批量选择。'
+        return
+      }
       stopPolygonEditing()
       feedback.value = '已结束当前面的编辑。'
     },
@@ -503,6 +627,7 @@ const setupSurfaceDragHandle = (selected: StoredOverlay): void => {
   }
 
   surfaceDragHandleMarker = handleMarker
+  surfaceWorkbenchMode = mode
 }
 
 const setSelectedBuildingCandidateIds = (ids: string[]): void => {
@@ -535,17 +660,35 @@ const applyBuildingCandidateStyle = (candidateId: string): void => {
   overlay.setOptions(isSelected ? CANDIDATE_SELECTED_STYLE : CANDIDATE_SURFACE_STYLE)
 }
 
-const setSelectedFeature = (nextId: string | null): void => {
+const refreshExportOverlaySelectionStyles = (): void => {
+  for (const overlayItem of overlays.values()) {
+    if (overlayItem.kind === 'export-point') {
+      applySelectionStyle(overlayItem, overlayItem.id === selectedFeatureId.value)
+      continue
+    }
+    const isSelected =
+      overlayItem.id === selectedFeatureId.value || selectedExportSurfaceLookup.value.has(overlayItem.id)
+    applySelectionStyle(overlayItem, isSelected)
+  }
+}
+
+const setSelectedExportSurfaceIds = (ids: string[]): void => {
+  const uniqIds = Array.from(new Set(ids))
+  selectedExportSurfaceIds.value = uniqIds
+  refreshExportOverlaySelectionStyles()
+  syncSurfaceWorkbenchForSelection()
+}
+
+const setSelectedFeature = (nextId: string | null, options?: { preserveMulti?: boolean }): void => {
   if (selectedFeatureId.value !== nextId && isEditingSelected.value) {
     stopPolygonEditing()
   }
-  if (selectedFeatureId.value && overlays.has(selectedFeatureId.value)) {
-    applySelectionStyle(overlays.get(selectedFeatureId.value) as StoredOverlay, false)
+  if (!options?.preserveMulti && selectedExportSurfaceIds.value.length) {
+    selectedExportSurfaceIds.value = []
   }
   selectedFeatureId.value = nextId
-  if (nextId && overlays.has(nextId)) {
-    applySelectionStyle(overlays.get(nextId) as StoredOverlay, true)
-  }
+  refreshExportOverlaySelectionStyles()
+  syncSurfaceWorkbenchForSelection()
 }
 
 const bindExportOverlayEvents = (overlayItem: StoredOverlay): void => {
@@ -701,6 +844,9 @@ const removeFeatureById = (id: string): void => {
   map.remove(target.overlay)
   overlays.delete(id)
   features = features.filter((feature) => String(feature.id) !== id)
+  if (selectedExportSurfaceLookup.value.has(id)) {
+    setSelectedExportSurfaceIds(selectedExportSurfaceIds.value.filter((featureId) => featureId !== id))
+  }
 
   if (selectedFeatureId.value === id) {
     setSelectedFeature(null)
@@ -726,6 +872,10 @@ const stopPolygonEditing = (): void => {
 
 const startEditSelected = (): void => {
   if (!map || !mapApi) return
+  if (isBatchSurfaceSelection.value) {
+    feedback.value = '当前为批量选择，请先结束批量状态后再编辑单个面。'
+    return
+  }
   if (!selectedFeatureId.value) {
     feedback.value = '请先选中一个面要素。'
     return
@@ -782,7 +932,7 @@ const startEditSelected = (): void => {
   polygonEditor.on('removenode', syncPolygon)
   polygonEditor.on('end', syncPolygon)
   polygonEditor.open()
-  setupSurfaceDragHandle(selected)
+  setupSurfaceDragHandle('single')
   isEditingSelected.value = true
   feedback.value = '面编辑模式已开启：可在上方工作区复制、规整、拖拽、删除或完成。'
 }
@@ -852,6 +1002,72 @@ const flattenSelectedSurface = (threshold: number = regularizeThreshold.value): 
     : '已退回最小外接矩形规整（智能规整未收敛）。'
 }
 
+const flattenBatchSelectedSurfaces = (threshold: number = regularizeThreshold.value): void => {
+  if (!isBatchSurfaceSelection.value) {
+    flattenSelectedSurface(threshold)
+    return
+  }
+
+  let successCount = 0
+  let skippedCount = 0
+  const nextGeometries = new Map<string, SurfaceGeometry>()
+
+  for (const id of selectedExportSurfaceIds.value) {
+    const feature = getSurfaceFeatureById(id)
+    const overlayItem = overlays.get(id)
+    if (!feature || overlayItem?.kind !== 'export-surface') {
+      skippedCount += 1
+      continue
+    }
+    const rings = geometryToSinglePolygonRings(feature.geometry)
+    if (!rings || rings.length !== 1) {
+      skippedCount += 1
+      continue
+    }
+    const regularizedOuterRing = regularizePolygonRing(rings[0], {
+      ...SURFACE_REGULARIZE_OPTIONS,
+      maxMoveRatio: threshold,
+      lineSnapDistanceMeters: SURFACE_REGULARIZE_OPTIONS.lineSnapDistanceMeters * (1 + threshold * 2),
+    })
+    const flattenedOuterRing = regularizedOuterRing ?? getMinimumAreaBoundingRectangle(rings[0])
+    if (!flattenedOuterRing) {
+      skippedCount += 1
+      continue
+    }
+    const nextGeometry = getSurfaceGeometryFromRings(feature.geometry.type, [flattenedOuterRing])
+    const nextPath = geometryToAmapPath(nextGeometry)
+    if (!nextPath) {
+      skippedCount += 1
+      continue
+    }
+    overlayItem.overlay.setPath(nextPath)
+    nextGeometries.set(id, nextGeometry)
+    successCount += 1
+  }
+
+  if (!successCount) {
+    feedback.value = '批量规整未生效：仅支持有效单环建筑面。'
+    return
+  }
+
+  features = features.map((feature) => {
+    if (feature.geometry.type === 'Point') return feature
+    const nextGeometry = nextGeometries.get(String(feature.id))
+    if (!nextGeometry) return feature
+    return {
+      ...feature,
+      geometry: nextGeometry,
+    }
+  })
+  syncGeojson()
+  refreshVisibleBuildingCandidates()
+  syncSurfaceDragHandlePosition()
+  feedback.value =
+    skippedCount > 0
+      ? `批量规整完成：成功 ${successCount} 个，跳过 ${skippedCount} 个。`
+      : `批量规整完成：成功 ${successCount} 个。`
+}
+
 const addPolygonFeature = (polygon: any): void => {
   const rings = getPolygonRingsFromOverlay(polygon)
   if (!rings.length) {
@@ -885,6 +1101,38 @@ const startDrawPolygon = (): void => {
   feedback.value = '面绘制模式已开启：点击地图开始绘制，双击结束。'
 }
 
+const startRectangleSelectExportSurfaces = (): void => {
+  if (!mouseTool) return
+  if (!hasExportSurfaceFeatures.value) {
+    feedback.value = '当前没有可框选的已有建筑面。'
+    return
+  }
+
+  stopPolygonEditing()
+  setSelectedFeature(null)
+  drawMode.value = 'export-rectangle'
+  mouseTool.close()
+  map?.setDefaultCursor('crosshair')
+  mouseTool.rectangle({
+    strokeColor: '#f59e0b',
+    strokeWeight: 2,
+    strokeOpacity: 0.9,
+    fillColor: '#fbbf24',
+    fillOpacity: 0.1,
+  })
+  feedback.value = '已有建筑面框选已开启：按住鼠标拖拽选择范围。'
+}
+
+const toggleRectangleSelectExportSurfaces = (): void => {
+  if (drawMode.value === 'export-rectangle') {
+    stopDrawing()
+    feedback.value = '已退出已有建筑面框选模式。'
+    return
+  }
+
+  startRectangleSelectExportSurfaces()
+}
+
 const toggleDrawPolygon = (): void => {
   if (drawMode.value === 'polygon') {
     stopDrawing()
@@ -906,10 +1154,15 @@ const handleWindowKeydown = (event: KeyboardEvent): void => {
   const tagName = target?.tagName
   if (tagName === 'INPUT' || tagName === 'TEXTAREA') return
 
-  if (drawMode.value === 'polygon' && event.key === 'Escape') {
+  if (
+    (drawMode.value === 'polygon' ||
+      drawMode.value === 'building-rectangle' ||
+      drawMode.value === 'export-rectangle') &&
+    event.key === 'Escape'
+  ) {
     event.preventDefault()
     stopDrawing()
-    feedback.value = '已取消当前面的绘制。'
+    feedback.value = '已取消当前框选/绘制操作。'
   }
 }
 
@@ -1087,6 +1340,18 @@ const toggleBuildingLayer = async (): Promise<void> => {
   feedback.value = '建筑面候选层已显示，可点击或框选建筑后加入导出集合。'
 }
 
+const handleToggleBuildingActions = async (): Promise<void> => {
+  if (isBuildingLayerVisible.value) {
+    await toggleBuildingLayer()
+    return
+  }
+
+  await toggleBuildingLayer()
+  if (isBuildingLayerVisible.value) {
+    isBuildingActionsExpanded.value = true
+  }
+}
+
 const startRectangleSelectBuildings = (): void => {
   if (!mouseTool) return
   if (!isBuildingLayerReady.value) {
@@ -1188,7 +1453,70 @@ const handleRectangleSelection = (rectangle: any): void => {
   feedback.value = `框选完成，候选建筑已选 ${nextIds.size} 条。`
 }
 
+const handleExportSurfaceRectangleSelection = (rectangle: any): void => {
+  if (!map) return
+
+  const bounds = rectangle?.getBounds?.()
+  map.remove(rectangle)
+  if (!bounds) {
+    feedback.value = '框选失败，请重试。'
+    return
+  }
+
+  const [minLng, minLat] = toLngLatPair(bounds.getSouthWest())
+  const [maxLng, maxLat] = toLngLatPair(bounds.getNorthEast())
+  const rectangleBounds: BBox = [minLng, minLat, maxLng, maxLat]
+  const matchedSurfaceIds: string[] = []
+
+  for (const feature of features) {
+    if (feature.geometry.type !== 'Polygon' && feature.geometry.type !== 'MultiPolygon') continue
+    const featureBounds = getBoundsFromGeometry(feature.geometry)
+    if (!featureBounds) continue
+    if (!bboxIntersects(featureBounds, rectangleBounds)) continue
+    matchedSurfaceIds.push(String(feature.id))
+  }
+
+  if (!matchedSurfaceIds.length) {
+    setSelectedExportSurfaceIds([])
+    setSelectedFeature(null)
+    feedback.value = '框选范围内未命中已有建筑面。'
+    return
+  }
+
+  setSelectedExportSurfaceIds(matchedSurfaceIds)
+  const targetFeatureId = matchedSurfaceIds[matchedSurfaceIds.length - 1]
+  setSelectedFeature(targetFeatureId, { preserveMulti: true })
+  if (matchedSurfaceIds.length === 1) {
+    startEditSelected()
+    feedback.value = '框选完成，已选中 1 个已有建筑面并进入编辑。'
+    return
+  }
+  feedback.value = `框选完成，已选中 ${matchedSurfaceIds.length} 个已有建筑面。`
+}
+
+const deleteBatchSelected = (): void => {
+  const ids = [...selectedExportSurfaceIds.value]
+  if (!ids.length) {
+    feedback.value = '请先框选需要删除的建筑面。'
+    return
+  }
+  stopPolygonEditing()
+  const prevCount = overlays.size
+  for (const id of ids) {
+    removeFeatureById(id)
+  }
+  const deletedCount = Math.max(prevCount - overlays.size, 0)
+  setSelectedExportSurfaceIds([])
+  setSelectedFeature(null)
+  teardownSurfaceDragHandle()
+  feedback.value = `已批量删除 ${deletedCount} 个建筑面。`
+}
+
 const deleteSelected = (): void => {
+  if (isBatchSurfaceSelection.value) {
+    deleteBatchSelected()
+    return
+  }
   if (!selectedFeatureId.value) {
     feedback.value = '请先在地图上点选一个导出要素。'
     return
@@ -1260,6 +1588,87 @@ const copySelectedFeature = (): void => {
   setSelectedFeature(String(copiedFeature.id))
   startEditSelected()
   feedback.value = '已复制选中面要素（已偏移），并进入复制体编辑。'
+}
+
+const copyBatchSelectedFeatures = (): void => {
+  const ids = [...selectedExportSurfaceIds.value]
+  if (!ids.length) {
+    feedback.value = '请先框选需要复制的建筑面。'
+    return
+  }
+
+  const nextFeatures = [...features]
+  const copiedIds: string[] = []
+
+  for (const id of ids) {
+    const feature = getSurfaceFeatureById(id)
+    if (!feature) continue
+    const bounds = getBoundsFromGeometry(feature.geometry)
+    if (!bounds) continue
+    const [minLng, minLat, maxLng, maxLat] = bounds
+    const lngSpan = Math.abs(maxLng - minLng)
+    const latSpan = Math.abs(maxLat - minLat)
+    const offsetLng = Math.max(lngSpan * 0.12, 0.00003)
+    const offsetLat = Math.max(latSpan * 0.12, 0.00003)
+    const copiedFeature: ExportFeature = {
+      ...feature,
+      id: createFeatureId(),
+      properties: {
+        ...(feature.properties ?? {}),
+      },
+      geometry:
+        feature.geometry.type === 'Polygon'
+          ? {
+              type: 'Polygon',
+              coordinates: feature.geometry.coordinates.map((ring) =>
+                ring.map((position) => [position[0] + offsetLng, position[1] + offsetLat] as [number, number]),
+              ),
+            }
+          : {
+              type: 'MultiPolygon',
+              coordinates: feature.geometry.coordinates.map((polygon) =>
+                polygon.map((ring) =>
+                  ring.map(
+                    (position) => [position[0] + offsetLng, position[1] + offsetLat] as [number, number],
+                  ),
+                ),
+              ),
+            },
+    }
+    registerExportFeature(copiedFeature)
+    nextFeatures.push(copiedFeature)
+    copiedIds.push(String(copiedFeature.id))
+  }
+
+  if (!copiedIds.length) {
+    feedback.value = '批量复制失败：未找到可复制的有效建筑面。'
+    return
+  }
+
+  features = nextFeatures
+  syncExportedBuildingSourceIds()
+  syncGeojson()
+  refreshVisibleBuildingCandidates()
+  setSelectedExportSurfaceIds(copiedIds)
+  setSelectedFeature(copiedIds[copiedIds.length - 1], { preserveMulti: true })
+  setupSurfaceDragHandle('batch')
+  feedback.value = `已批量复制 ${copiedIds.length} 个建筑面。`
+}
+
+const copySelected = (): void => {
+  if (isBatchSurfaceSelection.value) {
+    copyBatchSelectedFeatures()
+    return
+  }
+  copySelectedFeature()
+}
+
+const flattenSelectedSurfaces = (threshold: number = regularizeThreshold.value): void => {
+  if (isBatchSurfaceSelection.value) {
+    flattenBatchSelectedSurfaces(threshold)
+    return
+  }
+  flattenSelectedSurface(threshold)
 }
 
 const copyGeojson = async (): Promise<void> => {
@@ -1675,6 +2084,9 @@ onMounted(async () => {
       } else if (drawMode.value === 'building-rectangle') {
         handleRectangleSelection(event.obj)
         stopDrawing()
+      } else if (drawMode.value === 'export-rectangle') {
+        handleExportSurfaceRectangleSelection(event.obj)
+        stopDrawing()
       }
     })
 
@@ -1792,47 +2204,58 @@ onUnmounted(() => {
         >
           {{ drawMode === 'polygon' ? '完成绘制' : '绘制建筑面' }}
         </button>
+        <button
+          type="button"
+          class="btn block-btn"
+          :class="drawMode === 'export-rectangle' ? 'btn-primary' : 'btn-ghost'"
+          :disabled="!hasExportSurfaceFeatures"
+          @click="toggleRectangleSelectExportSurfaces"
+        >
+          {{ drawMode === 'export-rectangle' ? '取消框选' : '开启框选' }}
+        </button>
 
         <button
           type="button"
           class="btn block-btn"
           :class="isBuildingLayerVisible ? 'btn-primary' : 'btn-ghost'"
           :disabled="isBuildingDataLoading"
-          @click="toggleBuildingLayer"
+          @click="handleToggleBuildingActions"
         >
           {{
             isBuildingDataLoading
               ? '加载建筑面…'
               : isBuildingLayerVisible
-                ? '隐藏建筑候选'
-                : '显示建筑候选'
+                ? '关闭建筑候选'
+                : '候选建筑'
           }}
         </button>
 
-        <button
-          type="button"
-          class="btn btn-ghost block-btn"
-          :disabled="!isBuildingLayerReady || !canUseBuildingLayerAtCurrentZoom"
-          @click="startRectangleSelectBuildings"
-        >
-          框选建筑
-        </button>
-        <button
-          type="button"
-          class="btn btn-ghost block-btn"
-          :disabled="!selectedBuildingCandidateCount"
-          @click="addSelectedBuildingCandidates"
-        >
-          加入选中建筑
-        </button>
-        <button
-          type="button"
-          class="btn btn-ghost block-btn"
-          :disabled="!selectedBuildingCandidateCount"
-          @click="clearBuildingCandidateSelection"
-        >
-          清空候选选择
-        </button>
+        <div class="building-action-cluster" :class="{ expanded: isBuildingActionsExpanded }">
+          <button
+            type="button"
+            class="btn btn-ghost block-btn building-action-sub"
+            :disabled="!isBuildingLayerReady || !canUseBuildingLayerAtCurrentZoom"
+            @click="startRectangleSelectBuildings"
+          >
+            框选建筑
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost block-btn building-action-sub"
+            :disabled="!selectedBuildingCandidateCount"
+            @click="addSelectedBuildingCandidates"
+          >
+            加入选中建筑
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost block-btn building-action-sub"
+            :disabled="!selectedBuildingCandidateCount"
+            @click="clearBuildingCandidateSelection"
+          >
+            清空候选选择
+          </button>
+        </div>
         <p class="candidate-status">
           {{ buildingLayerStatus }}
         </p>
@@ -2198,6 +2621,67 @@ button.btn.export-trigger {
 
 .block-btn + .block-btn {
   margin-top: 2px;
+}
+
+.building-action-cluster {
+  position: relative;
+  --cluster-gap: 6px;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: var(--cluster-gap);
+  padding: 0 8px 0 14px;
+  margin-top: -2px;
+  transform: translateY(-10px) scaleY(0.95);
+  transform-origin: top left;
+  pointer-events: none;
+  transition:
+    max-height 220ms ease,
+    opacity 180ms ease,
+    transform 220ms ease,
+    margin-top 220ms ease,
+    padding-top 220ms ease;
+}
+
+.building-action-cluster::before {
+  content: '';
+  position: absolute;
+  left: 11px;
+  top: 8px;
+  bottom: 8px;
+  width: 1px;
+  background: linear-gradient(
+    180deg,
+    rgba(59, 130, 246, 0.45),
+    rgba(99, 102, 241, 0.18) 40%,
+    rgba(99, 102, 241, 0)
+  );
+}
+
+.building-action-cluster.expanded {
+  max-height: 180px;
+  opacity: 1;
+  margin-top: 4px;
+  padding-top: 4px;
+  transform: translateY(0) scaleY(1);
+  pointer-events: auto;
+}
+
+.building-action-sub {
+  position: relative;
+}
+
+.building-action-sub::before {
+  content: '';
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  width: 8px;
+  height: 1px;
+  background: rgba(59, 130, 246, 0.35);
+  transform: translateY(-50%);
 }
 
 .candidate-status {

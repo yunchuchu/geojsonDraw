@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 
 const props = defineProps<{
   initialRegularizeThreshold?: number
+  mode?: 'single' | 'batch'
+  selectionCount?: number
 }>()
 
 const emit = defineEmits<{
@@ -18,6 +20,12 @@ const regularizeThreshold = ref(props.initialRegularizeThreshold ?? 1)
 let flattenHoverCloseTimer: number | null = null
 
 const FLATTEN_HOVER_CLOSE_DELAY_MS = 220
+const workbenchMode = computed(() => props.mode ?? 'single')
+const copyLabel = computed(() => (workbenchMode.value === 'batch' ? '批量复制' : '复制'))
+const flattenLabel = computed(() => (workbenchMode.value === 'batch' ? '批量规整' : '规整'))
+const dragLabel = computed(() => (workbenchMode.value === 'batch' ? '整体拖拽' : '拖拽'))
+const removeLabel = computed(() => (workbenchMode.value === 'batch' ? '批量删除' : '删除'))
+const finishLabel = computed(() => (workbenchMode.value === 'batch' ? '结束批量' : '完成'))
 
 const clampThreshold = (value: number): number => Math.min(2, Math.max(0.05, value))
 
@@ -88,8 +96,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="surface-workbench">
-    <button type="button" class="surface-workbench__action" title="复制" @click="handleCopy">
-      复制
+    <button type="button" class="surface-workbench__action" :title="copyLabel" @click="handleCopy">
+      {{ copyLabel }}
     </button>
     <div
       class="surface-workbench__flatten-wrap"
@@ -119,29 +127,29 @@ onBeforeUnmount(() => {
         />
         <p class="surface-workbench__threshold-tip">提示：可多次点击“规整”逐步优化形状。</p>
       </div>
-      <button type="button" class="surface-workbench__action" title="规整" @click="handleFlatten">
-        规整
+      <button type="button" class="surface-workbench__action" :title="flattenLabel" @click="handleFlatten">
+        {{ flattenLabel }}
       </button>
     </div>
     <button
       type="button"
       class="surface-workbench__drag"
       aria-label="拖拽选中面"
-      title="拖拽"
+      :title="dragLabel"
       @mousedown="handleDragStart"
     >
-      拖拽
+      {{ dragLabel }}
     </button>
     <button
       type="button"
       class="surface-workbench__action surface-workbench__action--danger"
-      title="删除"
+      :title="removeLabel"
       @click="handleRemove"
     >
-      删除
+      {{ removeLabel }}
     </button>
-    <button type="button" class="surface-workbench__action" title="完成" @click="handleFinish">
-      完成
+    <button type="button" class="surface-workbench__action" :title="finishLabel" @click="handleFinish">
+      {{ finishLabel }}
     </button>
   </div>
 </template>
