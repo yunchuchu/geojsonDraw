@@ -2,6 +2,7 @@
 import AMapLoader from '@amap/amap-jsapi-loader'
 import buildingGeojsonUrl from './assets/sz84.geojson?url'
 import SurfaceWorkbench from './components/SurfaceWorkbench.vue'
+import SurfacePropertyTable from './components/SurfacePropertyTable.vue'
 import { computed, createApp, onMounted, onUnmounted, ref, watch } from 'vue'
 import type {
   Feature,
@@ -54,6 +55,88 @@ type AmapPlacePoi = {
   location?: string
 }
 
+type AmapPoiDetail = AmapPlacePoi & {
+  id?: string
+  type?: string
+  typecode?: string
+  tel?: string
+}
+
+type AmapWebPlaceDetailPoi = AmapPoiDetail & {
+  pname?: string
+  cityname?: string | string[]
+  citycode?: string
+  adname?: string
+  adcode?: string
+  pcode?: string
+  postcode?: string
+  website?: string
+  email?: string
+  entr_location?: string
+  exit_location?: string
+  navi_poiid?: string
+  gridcode?: string
+  alias?: string | string[]
+  business_area?: string | string[]
+  biz_type?: string
+  parking_type?: string
+}
+
+type AmapWebPlaceDetailResponse = {
+  status: string
+  info?: string
+  infocode?: string
+  pois?: AmapWebPlaceDetailPoi[]
+}
+
+type AmapRegeoAddressComponent = {
+  province?: string
+  city?: string | string[]
+  citycode?: string
+  district?: string
+  adcode?: string
+  township?: string
+  towncode?: string
+  neighborhood?: {
+    name?: string
+    type?: string
+  }
+  building?: {
+    name?: string
+    type?: string
+  }
+  streetNumber?: {
+    street?: string
+    number?: string
+    location?: string
+    direction?: string
+    distance?: string
+  }
+}
+
+type AmapRegeoResult = {
+  formatted_address?: string
+  addressComponent?: AmapRegeoAddressComponent
+}
+
+type AmapRegeoResponse = {
+  status: string
+  info?: string
+  infocode?: string
+  regeocode?: AmapRegeoResult
+}
+
+type InfoCardItem = {
+  label: string
+  value: string
+}
+
+type MapInfoCard = {
+  title: string
+  source: string
+  items: InfoCardItem[]
+}
+
 type StoredOverlay = {
   id: string
   kind: OverlayKind
@@ -68,6 +151,23 @@ type CandidateBuilding = {
   geometry: SurfaceGeometry
   properties: GeoJsonProperties
   bbox: BBox
+}
+
+type SurfaceQuickPropertyKey =
+  | 'height'
+  | 'name'
+  | 'adcode'
+  | 'citycode'
+  | 'fullAddress'
+  | 'streetNumber'
+  | 'communityName'
+
+type SurfaceQuickPropertyValues = Record<SurfaceQuickPropertyKey, string>
+
+type SurfaceCustomPropertyRow = {
+  id: string
+  key: string
+  value: string
 }
 
 const EXPORT_SURFACE_STYLE = {
@@ -106,6 +206,17 @@ const BUILDING_LAYER_MIN_ZOOM = 12
 const BUILDING_LAYER_RENDER_LIMIT = 1800
 const BUILDING_LAYER_BOUNDS_PADDING = 0.01
 const SURFACE_DRAG_HANDLE_OFFSET_PX = 44
+const SURFACE_QUICK_PROPERTY_KEYS: SurfaceQuickPropertyKey[] = [
+  'height',
+  'name',
+  'adcode',
+  'citycode',
+  'fullAddress',
+  'streetNumber',
+  'communityName',
+]
+const SURFACE_QUICK_PROPERTY_KEY_SET = new Set<string>(SURFACE_QUICK_PROPERTY_KEYS)
+const SURFACE_INTERNAL_PROPERTY_KEYS = new Set(['sourceType', 'buildingSourceId'])
 const SURFACE_REGULARIZE_OPTIONS = {
   angleSnapDeg: 10,
   lineSnapDistanceMeters: 0.8,
@@ -152,13 +263,29 @@ const hasBuildingDataLoaded = ref(false)
 const visibleBuildingCandidateCount = ref(0)
 const currentMapZoom = ref(11)
 const isBuildingActionsExpanded = ref(false)
+const selectedMapInfo = ref<MapInfoCard | null>(null)
+const isMapInfoLoading = ref(false)
+const surfaceQuickPropertyValues = ref<SurfaceQuickPropertyValues>({
+  height: '',
+  name: '',
+  adcode: '',
+  citycode: '',
+  fullAddress: '',
+  streetNumber: '',
+  communityName: '',
+})
+const surfaceCustomPropertyRows = ref<SurfaceCustomPropertyRow[]>([])
+const surfaceEditableCustomKeys = ref<string[]>([])
+const isSurfacePropertyPanelOpen = ref(false)
 
 let map: any | null = null
 let mouseTool: any | null = null
 let polygonEditor: any | null = null
 let suggestionTimer: number | null = null
 let suggestionRequestSeq = 0
+let mapInfoRequestSeq = 0
 let mapApi: any | null = null
+let placeSearchService: any | null = null
 let surfaceDragHandleMarker: any | null = null
 let surfaceDragStartPosition: [number, number] | null = null
 let surfaceDragStartItems:
@@ -211,6 +338,27 @@ const regularizeThreshold = ref(SURFACE_REGULARIZE_OPTIONS.maxMoveRatio)
 const canUseBuildingLayerAtCurrentZoom = computed(
   () => currentMapZoom.value >= BUILDING_LAYER_MIN_ZOOM,
 )
+const surfacePropertyPanelMode = computed<'single' | 'batch'>(() =>
+  isBatchSurfaceSelection.value ? 'batch' : 'single',
+)
+const surfacePropertyTargetCount = computed(() =>
+  isBatchSurfaceSelection.value ? selectedExportSurfaceIds.value.length : 1,
+)
+const hasSurfacePropertyTarget = computed(() => {
+  if (isBatchSurfaceSelection.value) {
+    return selectedExportSurfaceIds.value.length > 1
+  }
+  if (!selectedFeatureId.value) {
+    return false
+  }
+  return Boolean(getSurfaceFeatureById(selectedFeatureId.value))
+})
+const shouldShowSurfacePropertyPanel = computed(() => {
+  if (!hasSurfacePropertyTarget.value) return false
+  if (!isSurfacePropertyPanelOpen.value) return false
+  if (isBatchSurfaceSelection.value) return true
+  return isEditingSelected.value
+})
 const buildingLayerStatus = computed(() => {
   if (isBuildingDataLoading.value) {
     return '建筑面加载中...'
@@ -239,6 +387,397 @@ const toLngLatPair = (lngLat: any): [number, number] => {
     return [lngLat.getLng(), lngLat.getLat()]
   }
   return [lngLat?.lng ?? 0, lngLat?.lat ?? 0]
+}
+
+const safeInfoValue = (value: unknown): string | null => {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed ? trimmed : null
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  if (Array.isArray(value)) {
+    const text = value
+      .map((item) => safeInfoValue(item))
+      .filter((item): item is string => Boolean(item))
+      .join(' / ')
+    return text || null
+  }
+  return null
+}
+
+const createEmptySurfaceQuickPropertyValues = (): SurfaceQuickPropertyValues => ({
+  height: '',
+  name: '',
+  adcode: '',
+  citycode: '',
+  fullAddress: '',
+  streetNumber: '',
+  communityName: '',
+})
+
+const normalizeHeightPropertyValue = (rawValue: string): string | number => {
+  const trimmed = rawValue.trim()
+  if (!trimmed) return ''
+  const parsed = Number(trimmed)
+  if (Number.isFinite(parsed)) return parsed
+  return trimmed
+}
+
+const extractEditableCustomProperties = (
+  properties: GeoJsonProperties | null | undefined,
+): { rows: SurfaceCustomPropertyRow[]; keys: string[] } => {
+  if (!properties) {
+    return { rows: [], keys: [] }
+  }
+
+  const rows: SurfaceCustomPropertyRow[] = []
+  const keys: string[] = []
+  for (const [key, value] of Object.entries(properties)) {
+    if (SURFACE_QUICK_PROPERTY_KEY_SET.has(key) || SURFACE_INTERNAL_PROPERTY_KEYS.has(key)) {
+      continue
+    }
+    const text = safeInfoValue(value)
+    if (!text) continue
+    rows.push({
+      id: createFeatureId(),
+      key,
+      value: text,
+    })
+    keys.push(key)
+  }
+  return { rows, keys }
+}
+
+const resetSurfacePropertyEditor = (): void => {
+  surfaceQuickPropertyValues.value = createEmptySurfaceQuickPropertyValues()
+  surfaceCustomPropertyRows.value = []
+  surfaceEditableCustomKeys.value = []
+}
+
+const syncSurfacePropertyEditorFromSelection = (): void => {
+  if (isBatchSurfaceSelection.value) {
+    resetSurfacePropertyEditor()
+    return
+  }
+  if (!selectedFeatureId.value) {
+    resetSurfacePropertyEditor()
+    return
+  }
+  const selectedFeature = getSurfaceFeatureById(selectedFeatureId.value)
+  if (!selectedFeature) {
+    resetSurfacePropertyEditor()
+    return
+  }
+
+  const properties = selectedFeature.properties ?? {}
+  const nextQuickValues = createEmptySurfaceQuickPropertyValues()
+  for (const key of SURFACE_QUICK_PROPERTY_KEYS) {
+    nextQuickValues[key] = safeInfoValue(properties[key]) ?? ''
+  }
+  const { rows, keys } = extractEditableCustomProperties(properties)
+  surfaceQuickPropertyValues.value = nextQuickValues
+  surfaceCustomPropertyRows.value = rows
+  surfaceEditableCustomKeys.value = keys
+}
+
+const handleSurfaceQuickPropertyChange = (key: SurfaceQuickPropertyKey, value: string): void => {
+  surfaceQuickPropertyValues.value = {
+    ...surfaceQuickPropertyValues.value,
+    [key]: value,
+  }
+}
+
+const handleSurfaceCustomRowsChange = (rows: SurfaceCustomPropertyRow[]): void => {
+  surfaceCustomPropertyRows.value = rows
+}
+
+const toggleSurfacePropertyPanel = (): void => {
+  if (!hasSurfacePropertyTarget.value) return
+  isSurfacePropertyPanelOpen.value = !isSurfacePropertyPanelOpen.value
+}
+
+const applySurfacePropertiesToSingleFeature = (): void => {
+  if (!selectedFeatureId.value) {
+    feedback.value = '请先选中一个建筑面。'
+    return
+  }
+  const selectedFeature = getSurfaceFeatureById(selectedFeatureId.value)
+  if (!selectedFeature) {
+    feedback.value = '当前选中要素不是建筑面，无法设置属性。'
+    return
+  }
+
+  const nextProperties: GeoJsonProperties = {
+    ...(selectedFeature.properties ?? {}),
+  }
+
+  for (const key of surfaceEditableCustomKeys.value) {
+    delete nextProperties[key]
+  }
+
+  for (const key of SURFACE_QUICK_PROPERTY_KEYS) {
+    const rawValue = surfaceQuickPropertyValues.value[key]?.trim() ?? ''
+    if (!rawValue) {
+      delete nextProperties[key]
+      continue
+    }
+    nextProperties[key] = key === 'height' ? normalizeHeightPropertyValue(rawValue) : rawValue
+  }
+
+  for (const row of surfaceCustomPropertyRows.value) {
+    const customKey = row.key.trim()
+    const customValue = row.value.trim()
+    if (!customKey || !customValue) continue
+    if (SURFACE_INTERNAL_PROPERTY_KEYS.has(customKey)) continue
+    nextProperties[customKey] = customValue
+  }
+
+  updateFeature(String(selectedFeature.id), {
+    ...selectedFeature,
+    properties: nextProperties,
+  })
+  syncSurfacePropertyEditorFromSelection()
+  feedback.value = '建筑面属性已保存。'
+}
+
+const applySurfacePropertiesToBatchFeatures = (): void => {
+  const targetIds = new Set(selectedExportSurfaceIds.value)
+  if (!targetIds.size) {
+    feedback.value = '请先框选需要批量设置属性的建筑面。'
+    return
+  }
+
+  const patch: GeoJsonProperties = {}
+  for (const key of SURFACE_QUICK_PROPERTY_KEYS) {
+    const rawValue = surfaceQuickPropertyValues.value[key]?.trim() ?? ''
+    if (!rawValue) continue
+    patch[key] = key === 'height' ? normalizeHeightPropertyValue(rawValue) : rawValue
+  }
+
+  for (const row of surfaceCustomPropertyRows.value) {
+    const customKey = row.key.trim()
+    const customValue = row.value.trim()
+    if (!customKey || !customValue) continue
+    if (SURFACE_INTERNAL_PROPERTY_KEYS.has(customKey)) continue
+    patch[customKey] = customValue
+  }
+
+  if (!Object.keys(patch).length) {
+    feedback.value = '请至少填写一个属性后再批量应用。'
+    return
+  }
+
+  let updatedCount = 0
+  features = features.map((feature) => {
+    const id = String(feature.id)
+    if (!targetIds.has(id)) return feature
+    if (feature.geometry.type !== 'Polygon' && feature.geometry.type !== 'MultiPolygon') {
+      return feature
+    }
+    updatedCount += 1
+    return {
+      ...feature,
+      properties: {
+        ...(feature.properties ?? {}),
+        ...patch,
+      },
+    }
+  })
+
+  if (!updatedCount) {
+    feedback.value = '批量应用失败：未找到可更新的建筑面。'
+    return
+  }
+
+  syncExportedBuildingSourceIds()
+  syncGeojson()
+  refreshVisibleBuildingCandidates()
+  feedback.value = `已批量更新 ${updatedCount} 个建筑面的属性。`
+}
+
+const applySurfaceProperties = (): void => {
+  if (isBatchSurfaceSelection.value) {
+    applySurfacePropertiesToBatchFeatures()
+    return
+  }
+  applySurfacePropertiesToSingleFeature()
+}
+
+const showMapInfoCard = (title: string, source: string, items: InfoCardItem[]): void => {
+  selectedMapInfo.value = {
+    title,
+    source,
+    items: items.filter((item) => item.value),
+  }
+}
+
+const clearMapInfoCard = (): void => {
+  selectedMapInfo.value = null
+  isMapInfoLoading.value = false
+}
+
+const setMapInfoFromBuildingCandidate = (candidate: CandidateBuilding): void => {
+  const properties = candidate.properties ?? {}
+  const title =
+    safeInfoValue(
+      properties.name ??
+        properties.building_name ??
+        properties.buildingName ??
+        properties.label ??
+        properties.title,
+    ) ?? `候选建筑 ${candidate.id}`
+
+  const preferredItems: InfoCardItem[] = [
+    {
+      label: '小区/区域',
+      value:
+        safeInfoValue(
+          properties.community ??
+            properties.community_name ??
+            properties.estate ??
+            properties.neighborhood ??
+            properties.address,
+        ) ?? '',
+    },
+    {
+      label: '楼层高度',
+      value: safeInfoValue(properties.height) ?? '',
+    },
+    {
+      label: '数据来源',
+      value: safeInfoValue(properties._source) ?? '建筑候选图层',
+    },
+  ]
+
+  const extraItems = Object.entries(properties)
+    .filter(([key]) => !['name', 'building_name', 'buildingName', 'label', 'title'].includes(key))
+    .map(([key, value]) => ({
+      label: key,
+      value: safeInfoValue(value) ?? '',
+    }))
+    .filter((item) => item.value)
+    .slice(0, 6)
+
+  const preferredLabels = new Set(preferredItems.filter((item) => item.value).map((item) => item.label))
+  const mergedItems = [
+    ...preferredItems.filter((item) => item.value),
+    ...extraItems.filter((item) => !preferredLabels.has(item.label)),
+  ]
+
+  showMapInfoCard(title, '候选建筑', mergedItems)
+}
+
+const fetchPlaceDetailById = async (poiId: string): Promise<AmapWebPlaceDetailResponse> => {
+  const params = new URLSearchParams({
+    key: amapSearchKey ?? '',
+    id: poiId,
+    extensions: 'all',
+  })
+  const resp = await fetch(`https://restapi.amap.com/v3/place/detail?${params.toString()}`)
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}`)
+  }
+  return (await resp.json()) as AmapWebPlaceDetailResponse
+}
+
+const fetchRegeoByLocation = async (lng: number, lat: number): Promise<AmapRegeoResponse> => {
+  const params = new URLSearchParams({
+    key: amapSearchKey ?? '',
+    location: `${lng},${lat}`,
+    extensions: 'all',
+    radius: '100',
+  })
+  const resp = await fetch(`https://restapi.amap.com/v3/geocode/regeo?${params.toString()}`)
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}`)
+  }
+  return (await resp.json()) as AmapRegeoResponse
+}
+
+const fetchPlaceDetailFromSdk = (poiId: string): Promise<AmapPoiDetail | null> =>
+  new Promise((resolve) => {
+    if (!placeSearchService) {
+      resolve(null)
+      return
+    }
+    placeSearchService.getDetails(poiId, (status: string, result: any) => {
+      if (status !== 'complete' || result?.info !== 'OK') {
+        resolve(null)
+        return
+      }
+      resolve((result?.poiList?.pois?.[0] as AmapPoiDetail | undefined) ?? null)
+    })
+  })
+
+const buildHotspotInfoItems = (
+  poiId: string | null,
+  poiName: string,
+  hotspotLocation: [number, number] | null,
+  webPoi: AmapWebPlaceDetailPoi | null,
+  sdkPoi: AmapPoiDetail | null,
+  regeo: AmapRegeoResult | null,
+): InfoCardItem[] => {
+  const resolvedPoi = webPoi ?? sdkPoi
+  const component = regeo?.addressComponent
+  const cityValue = safeInfoValue(component?.city)
+  const districtText = [component?.province, cityValue, component?.district].filter(Boolean).join(' ')
+  const poiDistrict = [resolvedPoi?.pname, resolvedPoi?.cityname, resolvedPoi?.adname]
+    .map((value) => safeInfoValue(value))
+    .filter(Boolean)
+    .join(' ')
+  const streetNumberText = [component?.streetNumber?.street, component?.streetNumber?.number]
+    .filter(Boolean)
+    .join('')
+
+  const values: InfoCardItem[] = [
+    { label: 'POI ID', value: poiId ?? '' },
+    { label: '名称', value: safeInfoValue(resolvedPoi?.name) ?? poiName },
+    {
+      label: '行政区编码(adcode)',
+      value: safeInfoValue(webPoi?.adcode) ?? safeInfoValue(component?.adcode) ?? '',
+    },
+    {
+      label: '城市编码(citycode)',
+      value: safeInfoValue(webPoi?.citycode) ?? safeInfoValue(component?.citycode) ?? '',
+    },
+    { label: '完整地址', value: safeInfoValue(regeo?.formatted_address) ?? '' },
+    { label: '地址(POI)', value: safeInfoValue(resolvedPoi?.address) ?? '' },
+    { label: '省市区', value: districtText || poiDistrict },
+    {
+      label: '街道门牌',
+      value: streetNumberText,
+    },
+    {
+      label: '乡镇街道编码',
+      value: safeInfoValue(component?.towncode) ?? '',
+    },
+    { label: '小区/社区', value: safeInfoValue(component?.neighborhood?.name) ?? '' },
+    { label: '建筑', value: safeInfoValue(component?.building?.name) ?? '' },
+    { label: '类型', value: safeInfoValue(resolvedPoi?.type) ?? '' },
+    { label: '类型编码', value: safeInfoValue(resolvedPoi?.typecode) ?? '' },
+    { label: '行业类型', value: safeInfoValue(webPoi?.biz_type) ?? '' },
+    { label: '商圈', value: safeInfoValue(webPoi?.business_area) ?? '' },
+    { label: '电话', value: safeInfoValue(resolvedPoi?.tel) ?? '' },
+    { label: '邮编', value: safeInfoValue(webPoi?.postcode) ?? '' },
+    { label: '官网', value: safeInfoValue(webPoi?.website) ?? '' },
+    { label: '邮箱', value: safeInfoValue(webPoi?.email) ?? '' },
+    { label: '停车场类型', value: safeInfoValue(webPoi?.parking_type) ?? '' },
+    { label: '入口坐标', value: safeInfoValue(webPoi?.entr_location) ?? '' },
+    { label: '出口坐标', value: safeInfoValue(webPoi?.exit_location) ?? '' },
+    { label: '导航POI ID', value: safeInfoValue(webPoi?.navi_poiid) ?? '' },
+    { label: '网格编码', value: safeInfoValue(webPoi?.gridcode) ?? '' },
+    { label: '别名', value: safeInfoValue(webPoi?.alias) ?? '' },
+    {
+      label: '坐标',
+      value:
+        safeInfoValue(resolvedPoi?.location) ??
+        (hotspotLocation ? `${hotspotLocation[0].toFixed(6)}, ${hotspotLocation[1].toFixed(6)}` : ''),
+    },
+  ]
+  return values.filter((item) => item.value)
 }
 
 const getFeatureSource = (feature: ExportFeature): OverlaySource =>
@@ -313,6 +852,26 @@ const getSurfaceFeatureById = (id: string): Feature<SurfaceGeometry, GeoJsonProp
   }
   return feature as Feature<SurfaceGeometry, GeoJsonProperties>
 }
+
+watch(
+  [selectedFeatureId, selectedExportSurfaceIds, isBatchSurfaceSelection],
+  () => {
+    syncSurfacePropertyEditorFromSelection()
+  },
+  { immediate: true },
+)
+
+watch(
+  [isEditingSelected, isBatchSurfaceSelection, selectedFeatureId, selectedExportSurfaceIds],
+  () => {
+    const canKeepVisible =
+      isBatchSurfaceSelection.value || (Boolean(selectedFeatureId.value) && isEditingSelected.value)
+    if (!canKeepVisible) {
+      isSurfacePropertyPanelOpen.value = false
+    }
+  },
+  { immediate: true },
+)
 
 const getDragHandlePositionFromBounds = (bounds: BBox): [number, number] | null => {
   const centerLng = (bounds[0] + bounds[2]) / 2
@@ -599,6 +1158,9 @@ const setupSurfaceDragHandle = (mode: 'single' | 'batch' = 'single'): void => {
     mode,
     selectionCount: validSelectionIds.length,
     onDragStart: startDrag,
+    onTogglePropertyPanel: () => {
+      toggleSurfacePropertyPanel()
+    },
     onCopy: () => {
       copySelected()
     },
@@ -718,6 +1280,71 @@ const toggleBuildingCandidateSelection = (candidateId: string): void => {
   }
   setSelectedBuildingCandidateIds([...nextIds])
   feedback.value = `候选建筑已选 ${nextIds.size} 条，可点击“添加选中建筑”。`
+}
+
+const handleMapHotspotClick = async (event: any): Promise<void> => {
+  const requestSeq = ++mapInfoRequestSeq
+  const hotspotName = safeInfoValue(event?.name) ?? '地图兴趣点'
+  const hotspotLocation = event?.lnglat ? toLngLatPair(event.lnglat) : null
+  const fallbackItems: InfoCardItem[] = hotspotLocation
+    ? [{ label: '坐标', value: `${hotspotLocation[0].toFixed(6)}, ${hotspotLocation[1].toFixed(6)}` }]
+    : []
+
+  showMapInfoCard(hotspotName, '地图点位', fallbackItems)
+
+  const poiId = safeInfoValue(event?.id)
+  if (!poiId) {
+    return
+  }
+
+  isMapInfoLoading.value = true
+  try {
+    const tasks: Array<Promise<any>> = []
+    tasks.push(fetchPlaceDetailById(poiId))
+    tasks.push(fetchPlaceDetailFromSdk(poiId))
+    if (hotspotLocation) {
+      tasks.push(fetchRegeoByLocation(hotspotLocation[0], hotspotLocation[1]))
+    }
+
+    const [webDetailResult, sdkDetailResult, regeoResult] = await Promise.allSettled(tasks)
+    if (requestSeq !== mapInfoRequestSeq) return
+
+    const webDetail =
+      webDetailResult?.status === 'fulfilled' &&
+      webDetailResult.value?.status === '1' &&
+      Array.isArray(webDetailResult.value?.pois) &&
+      webDetailResult.value.pois.length
+        ? (webDetailResult.value.pois[0] as AmapWebPlaceDetailPoi)
+        : null
+
+    const sdkDetail =
+      sdkDetailResult?.status === 'fulfilled' ? (sdkDetailResult.value as AmapPoiDetail | null) : null
+
+    const regeoData =
+      regeoResult?.status === 'fulfilled' && regeoResult.value?.status === '1'
+        ? ((regeoResult.value as AmapRegeoResponse).regeocode ?? null)
+        : null
+
+    const mergedItems = buildHotspotInfoItems(
+      poiId,
+      hotspotName,
+      hotspotLocation,
+      webDetail,
+      sdkDetail,
+      regeoData,
+    )
+    showMapInfoCard(
+      safeInfoValue(webDetail?.name) ?? safeInfoValue(sdkDetail?.name) ?? hotspotName,
+      '地图点位',
+      mergedItems.length ? mergedItems : fallbackItems,
+    )
+  } catch {
+    if (requestSeq !== mapInfoRequestSeq) return
+  } finally {
+    if (requestSeq === mapInfoRequestSeq) {
+      isMapInfoLoading.value = false
+    }
+  }
 }
 
 const createExportPointMarker = (feature: Feature<Point>): StoredOverlay => {
@@ -1240,6 +1867,7 @@ const refreshVisibleBuildingCandidates = (): void => {
     polygon.setMap(map)
     polygon.on('click', () => {
       toggleBuildingCandidateSelection(candidateId)
+      setMapInfoFromBuildingCandidate(candidate)
     })
     buildingCandidateOverlays.set(candidateId, polygon)
     applyBuildingCandidateStyle(candidateId)
@@ -2050,7 +2678,13 @@ onMounted(async () => {
     mapApi = await AMapLoader.load({
       key: amapKey,
       version: '2.0',
-      plugins: ['AMap.Scale', 'AMap.ToolBar', 'AMap.MouseTool', 'AMap.PolygonEditor'],
+      plugins: [
+        'AMap.Scale',
+        'AMap.ToolBar',
+        'AMap.MouseTool',
+        'AMap.PolygonEditor',
+        'AMap.PlaceSearch',
+      ],
     })
 
     map = new mapApi.Map(mapContainer.value, {
@@ -2066,11 +2700,13 @@ onMounted(async () => {
       rotation: 0,
       pitchEnable: false,
       rotateEnable: false,
+      isHotspot: true,
     })
 
     currentMapZoom.value = map.getZoom()
     map.addControl(new mapApi.Scale())
     map.addControl(new mapApi.ToolBar())
+    placeSearchService = new mapApi.PlaceSearch()
 
     mouseTool = new mapApi.MouseTool(map)
     mouseTool.on('draw', (event: { obj?: any }) => {
@@ -2091,6 +2727,7 @@ onMounted(async () => {
     })
 
     map.on('dblclick', handleMapBlankDoubleClick)
+    map.on('hotspotclick', handleMapHotspotClick)
     map.on('moveend', () => {
       refreshVisibleBuildingCandidates()
       syncSurfaceDragHandlePosition()
@@ -2130,6 +2767,7 @@ onUnmounted(() => {
   map = null
   mouseTool = null
   mapApi = null
+  placeSearchService = null
 })
 </script>
 
@@ -2259,6 +2897,39 @@ onUnmounted(() => {
         <p class="candidate-status">
           {{ buildingLayerStatus }}
         </p>
+      </aside>
+
+      <SurfacePropertyTable
+        v-if="shouldShowSurfacePropertyPanel"
+        class="surface-property-panel-anchor"
+        :mode="surfacePropertyPanelMode"
+        :target-count="surfacePropertyTargetCount"
+        :quick-values="surfaceQuickPropertyValues"
+        :custom-rows="surfaceCustomPropertyRows"
+        :disabled="!hasSurfacePropertyTarget"
+        @update-quick-value="handleSurfaceQuickPropertyChange"
+        @update-custom-rows="handleSurfaceCustomRowsChange"
+        @apply="applySurfaceProperties"
+        @reset="syncSurfacePropertyEditorFromSelection"
+      />
+
+      <aside v-if="selectedMapInfo" class="poi-info-card" aria-label="地图点位信息">
+        <header class="poi-info-header">
+          <div>
+            <p class="poi-info-source">{{ selectedMapInfo.source }}</p>
+            <h3 class="poi-info-title">{{ selectedMapInfo.title }}</h3>
+          </div>
+          <button type="button" class="poi-info-close" aria-label="关闭信息" @click="clearMapInfoCard">
+            ×
+          </button>
+        </header>
+        <p v-if="isMapInfoLoading" class="poi-info-loading">正在获取更多详情...</p>
+        <ul v-if="selectedMapInfo.items.length" class="poi-info-list">
+          <li v-for="item in selectedMapInfo.items" :key="`${item.label}-${item.value}`">
+            <span class="poi-info-label">{{ item.label }}</span>
+            <span class="poi-info-value">{{ item.value }}</span>
+          </li>
+        </ul>
       </aside>
     </div>
 
@@ -2610,6 +3281,12 @@ button.btn.export-trigger {
   pointer-events: auto;
 }
 
+.surface-property-panel-anchor {
+  position: absolute;
+  top: 78px;
+  left: 248px;
+}
+
 .tool-panel .btn {
   border-radius: 8px;
 }
@@ -2695,6 +3372,86 @@ button.btn.export-trigger {
   background: rgba(249, 250, 251, 0.9);
   border-radius: 2px;
   border: none;
+}
+
+.poi-info-card {
+  position: absolute;
+  top: 78px;
+  right: 16px;
+  width: min(340px, calc(100vw - 32px));
+  padding: 12px 12px 10px;
+  border-radius: 14px;
+  border: 1px solid rgba(191, 219, 254, 0.92);
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.94), rgba(248, 250, 252, 0.96));
+  box-shadow:
+    0 18px 38px rgba(15, 23, 42, 0.16),
+    0 0 0 1px rgba(148, 163, 184, 0.16);
+  pointer-events: auto;
+}
+
+.poi-info-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.poi-info-source {
+  margin: 0;
+  font-size: 11px;
+  color: #2563eb;
+  letter-spacing: 0.02em;
+}
+
+.poi-info-title {
+  margin: 2px 0 0;
+  font-size: 15px;
+  line-height: 1.4;
+  color: #0f172a;
+}
+
+.poi-info-close {
+  border: none;
+  background: transparent;
+  color: #64748b;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.poi-info-loading {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.poi-info-list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.poi-info-list li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.poi-info-label {
+  color: #64748b;
+  flex: 0 0 auto;
+}
+
+.poi-info-value {
+  color: #0f172a;
+  text-align: right;
+  word-break: break-all;
 }
 
 .feedback-toast {
@@ -2870,6 +3627,12 @@ button.btn.export-trigger {
     left: 16px;
     right: auto;
     width: 220px;
+  }
+
+  .surface-property-panel-anchor {
+    top: auto;
+    bottom: 18px;
+    left: 248px;
   }
 }
 </style>

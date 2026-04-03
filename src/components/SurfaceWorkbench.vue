@@ -9,6 +9,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   dragStart: [event: MouseEvent]
+  togglePropertyPanel: []
   copy: []
   flatten: [threshold: number]
   remove: []
@@ -17,6 +18,7 @@ const emit = defineEmits<{
 
 const isFlattenHovering = ref(false)
 const regularizeThreshold = ref(props.initialRegularizeThreshold ?? 1)
+const isPropertyPanelVisible = ref(false)
 let flattenHoverCloseTimer: number | null = null
 
 const FLATTEN_HOVER_CLOSE_DELAY_MS = 220
@@ -26,6 +28,7 @@ const flattenLabel = computed(() => (workbenchMode.value === 'batch' ? '批量�
 const dragLabel = computed(() => (workbenchMode.value === 'batch' ? '整体拖拽' : '拖拽'))
 const removeLabel = computed(() => (workbenchMode.value === 'batch' ? '批量删除' : '删除'))
 const finishLabel = computed(() => (workbenchMode.value === 'batch' ? '结束批量' : '完成'))
+const propertyLabel = computed(() => (isPropertyPanelVisible.value ? '隐藏属性' : '属性'))
 
 const clampThreshold = (value: number): number => Math.min(2, Math.max(0.05, value))
 
@@ -59,6 +62,13 @@ const handleCopy = (event: MouseEvent): void => {
   event.preventDefault()
   event.stopPropagation()
   emit('copy')
+}
+
+const handleTogglePropertyPanel = (event: MouseEvent): void => {
+  event.preventDefault()
+  event.stopPropagation()
+  isPropertyPanelVisible.value = !isPropertyPanelVisible.value
+  emit('togglePropertyPanel')
 }
 
 const handleFlatten = (event: MouseEvent): void => {
@@ -96,8 +106,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="surface-workbench">
-    <button type="button" class="surface-workbench__action" :title="copyLabel" @click="handleCopy">
-      {{ copyLabel }}
+    <button type="button" class="surface-workbench__action" :title="finishLabel" @click="handleFinish">
+      {{ finishLabel }}
     </button>
     <div
       class="surface-workbench__flatten-wrap"
@@ -142,14 +152,23 @@ onBeforeUnmount(() => {
     </button>
     <button
       type="button"
+      class="surface-workbench__action"
+      :class="{ 'surface-workbench__action--active': isPropertyPanelVisible }"
+      :title="propertyLabel"
+      @click="handleTogglePropertyPanel"
+    >
+      {{ propertyLabel }}
+    </button>
+    <button type="button" class="surface-workbench__action" :title="copyLabel" @click="handleCopy">
+      {{ copyLabel }}
+    </button>
+    <button
+      type="button"
       class="surface-workbench__action surface-workbench__action--danger"
       :title="removeLabel"
       @click="handleRemove"
     >
       {{ removeLabel }}
-    </button>
-    <button type="button" class="surface-workbench__action" :title="finishLabel" @click="handleFinish">
-      {{ finishLabel }}
     </button>
   </div>
 </template>
@@ -159,6 +178,12 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.surface-workbench__action--active {
+  border-color: rgba(59, 130, 246, 0.9);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.2);
+  color: #1d4ed8;
 }
 
 .surface-workbench__flatten-wrap {
