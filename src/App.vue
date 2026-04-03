@@ -861,18 +861,6 @@ watch(
   { immediate: true },
 )
 
-watch(
-  [isEditingSelected, isBatchSurfaceSelection, selectedFeatureId, selectedExportSurfaceIds],
-  () => {
-    const canKeepVisible =
-      isBatchSurfaceSelection.value || (Boolean(selectedFeatureId.value) && isEditingSelected.value)
-    if (!canKeepVisible) {
-      isSurfacePropertyPanelOpen.value = false
-    }
-  },
-  { immediate: true },
-)
-
 const getDragHandlePositionFromBounds = (bounds: BBox): [number, number] | null => {
   const centerLng = (bounds[0] + bounds[2]) / 2
   const topLat = bounds[3]
@@ -1157,6 +1145,7 @@ const setupSurfaceDragHandle = (mode: 'single' | 'batch' = 'single'): void => {
     initialRegularizeThreshold: regularizeThreshold.value,
     mode,
     selectionCount: validSelectionIds.length,
+    propertyPanelVisible: isSurfacePropertyPanelOpen.value,
     onDragStart: startDrag,
     onTogglePropertyPanel: () => {
       toggleSurfacePropertyPanel()
@@ -1173,12 +1162,14 @@ const setupSurfaceDragHandle = (mode: 'single' | 'batch' = 'single'): void => {
     },
     onFinish: () => {
       if (mode === 'batch') {
+        isSurfacePropertyPanelOpen.value = false
         setSelectedExportSurfaceIds([])
         setSelectedFeature(null)
         teardownSurfaceDragHandle()
         feedback.value = '已结束当前批量选择。'
         return
       }
+      isSurfacePropertyPanelOpen.value = false
       stopPolygonEditing()
       feedback.value = '已结束当前面的编辑。'
     },

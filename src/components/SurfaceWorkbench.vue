@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 const props = defineProps<{
   initialRegularizeThreshold?: number
   mode?: 'single' | 'batch'
   selectionCount?: number
+  propertyPanelVisible?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -18,7 +19,7 @@ const emit = defineEmits<{
 
 const isFlattenHovering = ref(false)
 const regularizeThreshold = ref(props.initialRegularizeThreshold ?? 1)
-const isPropertyPanelVisible = ref(false)
+const isPropertyPanelVisible = ref(Boolean(props.propertyPanelVisible))
 let flattenHoverCloseTimer: number | null = null
 
 const FLATTEN_HOVER_CLOSE_DELAY_MS = 220
@@ -98,6 +99,13 @@ const handleThresholdInput = (event: Event): void => {
 const stopPointerPropagation = (event: Event): void => {
   event.stopPropagation()
 }
+
+watch(
+  () => props.propertyPanelVisible,
+  (visible) => {
+    isPropertyPanelVisible.value = Boolean(visible)
+  },
+)
 
 onBeforeUnmount(() => {
   clearFlattenHoverCloseTimer()
