@@ -3,6 +3,9 @@ import AMapLoader from '@amap/amap-jsapi-loader'
 import buildingGeojsonUrl from './assets/sz84.geojson?url'
 import SurfaceWorkbench from './components/SurfaceWorkbench.vue'
 import SurfacePropertyTable from './components/SurfacePropertyTable.vue'
+import UserManualButton from './components/UserManualButton.vue'
+import UserManualModal from './components/UserManualModal.vue'
+import userManualMarkdown from './docs/user-manual.md?raw'
 import { computed, createApp, onMounted, onUnmounted, ref, watch } from 'vue'
 import type {
   Feature,
@@ -255,6 +258,7 @@ const geojsonText = ref(
 const feedback = ref('提示：双击地图空白处也可自动开始绘制。')
 
 const isExportModalOpen = ref(false)
+const isUserManualOpen = ref(false)
 const showGeojsonText = ref(false)
 const isEditingSelected = ref(false)
 const isBuildingLayerVisible = ref(false)
@@ -2807,6 +2811,10 @@ onUnmounted(() => {
         </div>
       </header>
 
+      <div class="manual-entry">
+        <UserManualButton @click="isUserManualOpen = true" />
+      </div>
+
       <Teleport to="body">
         <ul
           v-if="searchTips.length"
@@ -2986,6 +2994,13 @@ onUnmounted(() => {
         </div>
       </section>
     </div>
+
+    <UserManualModal
+      :open="isUserManualOpen"
+      title="GeoJson 建筑面工具操作手册"
+      :markdown="userManualMarkdown"
+      @close="isUserManualOpen = false"
+    />
   </main>
 </template>
 
@@ -3015,6 +3030,14 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+.manual-entry {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 1200;
+  pointer-events: auto;
 }
 
 .top-strip {
